@@ -1,8 +1,34 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
-import type { Store } from "./types.js";
+import type {
+  Store,
+  SyncRowInput,
+  SyncRowRecord,
+  BatchResult,
+  ListResult,
+} from "./types.js";
 import { runMigrations, currentVersion } from "./migrations.js";
+
+// Shape of a sync_rows row as it comes back from better-sqlite3. envelope is a
+// Buffer (BLOB) and deleted is a 0/1 integer.
+interface SyncRowDb {
+  entity_id: string;
+  envelope: Buffer;
+  seq: number;
+  deleted: number;
+  server_mtime: string;
+}
+
+function toRecord(row: SyncRowDb): SyncRowRecord {
+  return {
+    entityId: row.entity_id,
+    envelope: row.envelope,
+    seq: row.seq,
+    deleted: row.deleted !== 0,
+    serverMtime: row.server_mtime,
+  };
+}
 
 // SQLite-backed Store. SQLite serializes all writes through a single writer, so
 // a per-account counter bumped inside a transaction is naturally monotonic.
@@ -51,6 +77,99 @@ export class SqliteStore implements Store {
   // avoids a deferred-to-write lock upgrade deadlocking against another writer.
   transaction<T>(fn: () => T): T {
     return this.db.transaction(fn).immediate();
+  }
+
+  // Upsert a batch. Each row gets a freshly bumped seq, assigned inside the same
+  // transaction as the write so seq and row commit together. On conflict the row
+  // is replaced with the new envelope, seq, deleted, and server_mtime, using the
+  // newly assigned seq (excluded.seq) rather than the original, so a re-upserted
+  // row advances past its previous cursor position. A single batch of K rows
+  // advances the account seq by exactly K, never more.
+  batchUpsert(app: string, accountId: string, rows: SyncRowInput[]): BatchResult {
+    const upsert = this.db.prepare(
+      `INSERT INTO sync_rows (account_id, app, entity_id, seq, envelope, deleted, server_mtime)
+       VALUES (@account_id, @app, @entity_id, @seq, @envelope, @deleted, @server_mtime)
+       ON CONFLICT (account_id, app, entity_id) DO UPDATE SET
+         envelope = excluded.envelope,
+         seq = excluded.seq,
+         deleted = excluded.deleted,
+         server_mtime = excluded.server_mtime`,
+    );
+
+    return this.transaction(() => {
+      let written = 0;
+      let maxSeq = 0;
+      for (const row of rows) {
+        const seq = this.nextSeq(accountId);
+        upsert.run({
+          account_id: accountId,
+          app,
+          entity_id: row.entityId,
+          seq,
+          envelope: row.envelope,
+          deleted: row.deleted ? 1 : 0,
+          server_mtime: new Date().toISOString(),
+        });
+        written += 1;
+        if (seq > maxSeq) {
+          maxSeq = seq;
+        }
+      }
+      return { written, maxSeq };
+    });
+  }
+
+  // Incremental fetch. Over-fetch by one row to determine hasMore without a
+  // separate COUNT, then trim back to the requested limit.
+  listRows(app: string, accountId: string, since: number, limit: number): ListResult {
+    const dbRows = this.db
+      .prepare(
+        `SELECT entity_id, envelope, seq, deleted, server_mtime
+         FROM sync_rows
+         WHERE account_id = ? AND app = ? AND seq > ?
+         ORDER BY seq ASC
+         LIMIT ?`,
+      )
+      .all(accountId, app, since, limit + 1) as SyncRowDb[];
+
+    const hasMore = dbRows.length > limit;
+    const page = hasMore ? dbRows.slice(0, limit) : dbRows;
+    return { rows: page.map(toRecord), hasMore };
+  }
+
+  getRow(app: string, accountId: string, entityId: string): SyncRowRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT entity_id, envelope, seq, deleted, server_mtime
+         FROM sync_rows
+         WHERE account_id = ? AND app = ? AND entity_id = ?`,
+      )
+      .get(accountId, app, entityId) as SyncRowDb | undefined;
+    return row ? toRecord(row) : null;
+  }
+
+  // Soft-delete: mark the row deleted, assign a new seq, and update server_mtime
+  // inside one transaction. Returns null if the row does not exist.
+  softDeleteRow(app: string, accountId: string, entityId: string): { seq: number } | null {
+    return this.transaction(() => {
+      const existing = this.db
+        .prepare(
+          `SELECT 1 FROM sync_rows WHERE account_id = ? AND app = ? AND entity_id = ?`,
+        )
+        .get(accountId, app, entityId);
+      if (!existing) {
+        return null;
+      }
+      const seq = this.nextSeq(accountId);
+      this.db
+        .prepare(
+          `UPDATE sync_rows
+           SET deleted = 1, seq = ?, server_mtime = ?
+           WHERE account_id = ? AND app = ? AND entity_id = ?`,
+        )
+        .run(seq, new Date().toISOString(), accountId, app, entityId);
+      return { seq };
+    });
   }
 
   close(): void {
