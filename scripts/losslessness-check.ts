@@ -9,20 +9,30 @@
 //
 // Envelope file structure this script depends on:
 //
-//   The @glance-apps/sync package writes one file per entity, named
-//   <entityId>.json, into the app's sync directory. The entity id is the
-//   filename stem; it is NOT a field inside the JSON. Each file is a JSON object
-//   with these fields:
+//   Each app's file-tier sync directory holds one or more JSON envelope files,
+//   each named <name>.json. For cloud SYNC the directory holds a single payload
+//   file per app: the whole encrypted sync state is one opaque blob, not one
+//   file per entity. (Intents, a later phase, instead write one file per event,
+//   so an intents directory holds many.) This script does not care which: it
+//   round-trips every .json file it finds, keyed by the filename stem.
+//
+//   Each file is a JSON object with these fields:
 //     - v:    number, the envelope format version (always 1)
 //     - enc:  string, the encryption scheme (always "AES-GCM-256")
-//     - data: base64 string, the opaque ciphertext (the full encrypted envelope:
-//             salt + nonce + ciphertext)
+//     - data: base64 string, the opaque ciphertext (the full encrypted payload)
 //
-//   Only `data` carries the bytes this check round-trips, and the entity id
-//   comes from the filename. The `data` bytes are treated as fully opaque here,
-//   exactly as the server treats them. This script never decrypts and never
-//   parses them. readEnvelopes below is the single place that knows the file
-//   format, so any future shape change is a one-place edit.
+//   Only `data` carries the bytes this check round-trips. The server row key
+//   (entity_id) is the filename stem; it is NOT a field inside the JSON. The
+//   `data` bytes are treated as fully opaque here, exactly as the server treats
+//   them: this script never decrypts and never parses them. readEnvelopes below
+//   is the single place that knows the file format, so any future shape change
+//   is a one-place edit.
+//
+//   What this proves: with a single blob per app, the check confirms the server
+//   stores and returns opaque bytes losslessly (one row per app). It does not
+//   shred a payload into per-entity rows, since that structure lives inside the
+//   encrypted blob the server never opens. The per-entity row path is covered by
+//   the Phase 1 synthetic hammer tests.
 //
 // Run with:
 //   npx tsx scripts/losslessness-check.ts
