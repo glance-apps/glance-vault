@@ -104,9 +104,15 @@ on the wire and stored as a BLOB the server never parses.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/sync/:app/batch` | Upsert a batch of rows, each assigned a new seq |
+| POST | `/sync/:app/device` | Report a device's sync cursor (forward only) |
 | GET | `/sync/:app/list` | Incremental fetch of rows with `seq > since` |
 | GET | `/sync/:app/:entityId` | Fetch a single row, or 404 |
 | DELETE | `/sync/:app/:entityId` | Soft-delete a row (sets a tombstone, advances seq) |
+
+The device cursor (`POST /sync/:app/device`, body `{ accountId, deviceId,
+lastSeenSeq }`) records how far a device has synced, advancing `last_seen_seq`
+forward only. It is account scoped, not per app, and feeds coordinated tombstone
+GC in a later phase. Returns `{ updated: true }`.
 
 `seq` is a server-assigned monotonic cursor per account. Clients page forward by
 passing the highest `seq` they have seen as `since`. `list` accepts `limit`
