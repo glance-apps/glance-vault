@@ -5,4 +5,5 @@ data/
 *.db-wal
 *.db-shm
 .env
+.env.phase2
 config.json
