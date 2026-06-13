@@ -4,6 +4,7 @@ import type { Store } from "./storage/types.js";
 import { deviceTokenAuth } from "./middleware/auth.js";
 import { healthRouter } from "./routes/health.js";
 import { syncRouter } from "./routes/sync.js";
+import { saltRouter } from "./routes/salt.js";
 
 // Build the Express app. Kept separate from the listen() call in index.ts so it
 // can be constructed in tests without binding a port.
@@ -19,9 +20,10 @@ export function buildApp(config: Config, store: Store): Express {
 
   app.use(deviceTokenAuth(config.deviceToken));
 
-  // Protected routes. Phase 1 adds the sync transport. Intents and media land
-  // in later phases.
+  // Protected routes. Phase 1 adds the sync transport; the salt store is a
+  // Phase 3 prerequisite. Intents and media land in later phases.
   app.use("/sync", syncRouter(store));
+  app.use("/salt", saltRouter(store));
 
   return app;
 }
