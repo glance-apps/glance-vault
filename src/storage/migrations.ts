@@ -63,6 +63,21 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 2,
+    sql: `
+      -- One key-derivation salt per account. The salt is not secret: its only
+      -- jobs are uniqueness and defeating precomputation, so storing it on an
+      -- untrusted host is safe (a salt without the passphrase is useless). The
+      -- server treats the salt as an opaque base64 string and never decodes it.
+      -- A new device fetches it to derive the same root key from the passphrase.
+      CREATE TABLE account_salts (
+        account_id TEXT NOT NULL PRIMARY KEY,
+        salt       TEXT NOT NULL,   -- base64-encoded bytes, opaque to the server
+        created_at TEXT NOT NULL    -- ISO timestamp
+      );
+    `,
+  },
 ];
 
 // The schema version the migration set advances to. This must match the
