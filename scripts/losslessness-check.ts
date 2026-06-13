@@ -10,24 +10,19 @@
 // Envelope file structure this script depends on:
 //
 //   The @glance-apps/sync package writes one file per entity, named
-//   <entityId>.json, into the app's sync directory. Each file is a JSON object
-//   containing at least:
-//     - id:         the stable entity id (the same value as the filename stem)
-//     - ciphertext: a base64-encoded byte string holding the full Phase 2.7
-//                   envelope (salt + nonce + ciphertext)
+//   <entityId>.json, into the app's sync directory. The entity id is the
+//   filename stem; it is NOT a field inside the JSON. Each file is a JSON object
+//   with these fields:
+//     - v:    number, the envelope format version (always 1)
+//     - enc:  string, the encryption scheme (always "AES-GCM-256")
+//     - data: base64 string, the opaque ciphertext (the full encrypted envelope:
+//             salt + nonce + ciphertext)
 //
-//   The ciphertext bytes are treated as fully opaque here, exactly as the
-//   server treats them. This script never decrypts and never parses the
-//   ciphertext. The entity id is taken from the `id` field, falling back to the
-//   filename stem if `id` is absent.
-//
-// Source of truth for the above: the GLANCEvault server spec (docs, the
-// Envelope interface in section 3.3: entityId plus ciphertext bytes) and the
-// Phase 2 task brief. The @glance-apps/sync repo (glance-sync) is a sibling
-// repo on the operator machine but was not accessible from the environment this
-// script was authored in, so the field names and encoding are documented here
-// from the spec. If the on-disk shape differs, adjust readEnvelopes below; it
-// is the single place that knows the file format.
+//   Only `data` carries the bytes this check round-trips, and the entity id
+//   comes from the filename. The `data` bytes are treated as fully opaque here,
+//   exactly as the server treats them. This script never decrypts and never
+//   parses them. readEnvelopes below is the single place that knows the file
+//   format, so any future shape change is a one-place edit.
 //
 // Run with:
 //   npx tsx scripts/losslessness-check.ts
@@ -131,8 +126,9 @@ function appAccountId(accountId: string, app: string): string {
 }
 
 // Read every .json envelope file in a directory. Returns one DiskEnvelope per
-// unique entity id. A malformed file or a file missing its ciphertext is a hard
-// error: losslessness must be exact, so nothing is silently skipped.
+// unique entity id. The entity id is the filename stem. A malformed file or a
+// file missing its `data` field is a hard error: losslessness must be exact, so
+// nothing is silently skipped.
 async function readEnvelopes(dir: string): Promise<DiskEnvelope[]> {
   const names = (await readdir(dir)).filter((name) => name.toLowerCase().endsWith(".json"));
   const byId = new Map<string, Buffer>();
@@ -150,21 +146,21 @@ async function readEnvelopes(dir: string): Promise<DiskEnvelope[]> {
     }
     const obj = parsed as Record<string, unknown>;
 
-    const ciphertext = obj.ciphertext;
-    if (typeof ciphertext !== "string") {
+    const data = obj.data;
+    if (typeof data !== "string") {
       die(
-        `Envelope file ${full} has no string "ciphertext" field ` +
+        `Envelope file ${full} has no string "data" field ` +
           `(keys present: ${Object.keys(obj).join(", ") || "none"})`,
       );
     }
 
-    const idField = typeof obj.id === "string" && obj.id.trim() !== "" ? obj.id : null;
-    const entityId = idField ?? basename(name, ".json");
+    // The entity id is the filename stem, not a field in the JSON.
+    const entityId = basename(name, ".json");
 
     // base64-decode to the raw envelope bytes. This is the canonical form used
     // for both seeding and the final byte comparison, so a non-canonical base64
     // on disk cannot cause a false mismatch.
-    byId.set(entityId, Buffer.from(ciphertext, "base64"));
+    byId.set(entityId, Buffer.from(data, "base64"));
   }
 
   return [...byId.entries()].map(([entityId, bytes]) => ({ entityId, bytes }));
