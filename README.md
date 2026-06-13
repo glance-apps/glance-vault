@@ -164,7 +164,15 @@ Configuration is via environment variables (see `.env.phase2.example`):
 ```
 cp .env.phase2.example .env.phase2
 # edit .env.phase2 to set the token and the three sync directory paths
-set -a; . ./.env.phase2; set +a
+npm run lossless-check
+```
+
+`npm run lossless-check` auto-loads `.env.phase2` if it is present, so there is
+no separate step to export the variables. If you keep the config somewhere else,
+you can still load it yourself and call the script directly:
+
+```
+set -a; . ./my-config.env; set +a
 npx tsx scripts/losslessness-check.ts
 ```
 
