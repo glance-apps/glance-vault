@@ -86,6 +86,15 @@ export class SqliteStore implements Store {
   // row advances past its previous cursor position. A single batch of K rows
   // advances the account seq by exactly K, never more.
   batchUpsert(app: string, accountId: string, rows: SyncRowInput[]): BatchResult {
+    // An identical re-send (same envelope bytes) intentionally advances seq
+    // rather than no-opping. This is the designed behavior: it keeps every write
+    // a uniform "assign a new seq and overwrite" so a partial-write retry is
+    // always safe and self-healing (re-sent rows are simply re-applied, never
+    // specially detected). Content-aware idempotency (skip the bump when bytes
+    // are unchanged) was considered and rejected: it would require reading and
+    // comparing each existing envelope inside the write path, and the only cost
+    // of advancing seq is that other devices re-pull identical bytes, which they
+    // apply harmlessly.
     const upsert = this.db.prepare(
       `INSERT INTO sync_rows (account_id, app, entity_id, seq, envelope, deleted, server_mtime)
        VALUES (@account_id, @app, @entity_id, @seq, @envelope, @deleted, @server_mtime)
