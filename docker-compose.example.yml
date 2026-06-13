@@ -1,0 +1,33 @@
+# Example docker-compose for a self-hosted GLANCEvault.
+#
+# All three GLANCE apps (dayGLANCE, lastGLANCE, lifeGLANCE) point at this one
+# server. There is one endpoint and one device token shared across them; the
+# server namespaces each app's rows with the "app" column, so a single instance
+# backs the whole suite.
+#
+# Quick start:
+#   1. cp .env.example .env  and set GLANCEVAULT_DEVICE_TOKEN to a long secret.
+#   2. docker compose -f docker-compose.example.yml up --build
+#   3. curl http://localhost:8080/healthz
+#
+# The SQLite file lives on the named volume below, so it survives restarts. On a
+# fresh, empty volume the server runs migrations on boot and comes up working.
+
+services:
+  glancevault:
+    build: .
+    image: glancevault:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # The single device auth token, supplied via the environment. Required.
+      GLANCEVAULT_DEVICE_TOKEN: ${GLANCEVAULT_DEVICE_TOKEN:?set GLANCEVAULT_DEVICE_TOKEN in your .env}
+      GLANCEVAULT_PORT: "8080"
+      GLANCEVAULT_STORAGE_PATH: /data/glancevault.db
+    volumes:
+      # Named volume holding the SQLite database file.
+      - glancevault-data:/data
+
+volumes:
+  glancevault-data:
