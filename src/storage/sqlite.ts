@@ -214,6 +214,22 @@ export class SqliteStore implements Store {
     });
   }
 
+  // Forward-only device cursor. The single upsert is atomic on its own: on
+  // conflict, last_seen_seq becomes MAX(existing, supplied) so a stale or
+  // out-of-order report can never move a cursor backward. last_active is always
+  // refreshed to now.
+  updateDeviceCursor(accountId: string, deviceId: string, lastSeenSeq: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO devices (account_id, device_id, last_seen_seq, last_active)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(account_id, device_id) DO UPDATE SET
+           last_seen_seq = MAX(last_seen_seq, excluded.last_seen_seq),
+           last_active = excluded.last_active`,
+      )
+      .run(accountId, deviceId, lastSeenSeq, new Date().toISOString());
+  }
+
   close(): void {
     this.db.close();
   }

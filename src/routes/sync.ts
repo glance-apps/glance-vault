@@ -93,6 +93,33 @@ export function syncRouter(store: Store): Router {
     res.status(200).json(result);
   });
 
+  // Report a device's sync cursor. Body: { accountId, deviceId, lastSeenSeq }.
+  // The cursor moves forward only (MAX), so a stale report cannot rewind it. The
+  // device cursor is account scoped, not per app (seq is assigned per account);
+  // the :app segment is kept only for route consistency with the other sync
+  // endpoints. Used later for coordinated tombstone GC.
+  router.post("/:app/device", json({ limit: "16kb" }), (req: Request, res: Response) => {
+    const body = req.body as { accountId?: unknown; deviceId?: unknown; lastSeenSeq?: unknown };
+    if (typeof body.accountId !== "string" || body.accountId.trim() === "") {
+      res.status(400).json({ error: "accountId is required" });
+      return;
+    }
+    if (typeof body.deviceId !== "string" || body.deviceId.trim() === "") {
+      res.status(400).json({ error: "deviceId is required" });
+      return;
+    }
+    if (
+      typeof body.lastSeenSeq !== "number" ||
+      !Number.isInteger(body.lastSeenSeq) ||
+      body.lastSeenSeq < 0
+    ) {
+      res.status(400).json({ error: "lastSeenSeq must be a non-negative integer" });
+      return;
+    }
+    store.updateDeviceCursor(body.accountId, body.deviceId, body.lastSeenSeq);
+    res.status(200).json({ updated: true });
+  });
+
   // Incremental fetch. Query: accountId, since (seq cursor, default 0), limit
   // (default 500, max 1000). Returns rows with seq > since, ascending.
   router.get("/:app/list", (req: Request, res: Response) => {

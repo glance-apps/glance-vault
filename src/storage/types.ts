@@ -95,6 +95,13 @@ export interface Store {
   // supplied one. created is true when this call stored a new salt.
   putSaltIfAbsent(accountId: string, salt: string): SaltRecord & { created: boolean };
 
+  // Move a device's cursor forward. Upserts the (account, device) row, advancing
+  // last_seen_seq to the MAX of the stored and supplied values so the cursor
+  // never goes backward, and refreshing last_active. The cursor is account
+  // scoped (seq is assigned per account, shared across apps), not per app. Used
+  // later for coordinated tombstone GC.
+  updateDeviceCursor(accountId: string, deviceId: string, lastSeenSeq: number): void;
+
   // Release underlying resources (database handle, etc.).
   close(): void;
 }
