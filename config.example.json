@@ -1,0 +1,5 @@
+{
+  "storagePath": "./data/glancevault.db",
+  "port": 8080,
+  "deviceToken": "replace-with-a-long-random-secret"
+}
