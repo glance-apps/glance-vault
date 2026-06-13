@@ -3,9 +3,9 @@
 Optional self-hosted backend for the GLANCE apps: zero-knowledge sync,
 cross-device intents, and media storage.
 
-Status: Phase 0 (server skeleton). It builds, runs, holds the schema, and
-authenticates a device token. Sync, intents, and media endpoints are not
-implemented yet; those are later phases. See
+Status: Phase 1 (sync transport). The server builds, runs, holds the schema,
+authenticates a device token, and serves the sync transport endpoints. Intents
+and media endpoints are not implemented yet; those are later phases. See
 `docs/GLANCEvault-server-spec.md` for the full design and build plan.
 
 ## What Phase 0 includes
@@ -92,6 +92,50 @@ Expected response:
 { "status": "ok", "version": "0.1.0", "schemaVersion": 1 }
 ```
 
+## Sync transport endpoints
+
+All sync endpoints sit under `/sync` and require the device token. The `:app`
+path segment must be one of `dayglance`, `lastglance`, or `lifeglance`; anything
+else is rejected with 400. The `envelope` field is opaque bytes: base64-encoded
+on the wire and stored as a BLOB the server never parses.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/sync/:app/batch` | Upsert a batch of rows, each assigned a new seq |
+| GET | `/sync/:app/list` | Incremental fetch of rows with `seq > since` |
+| GET | `/sync/:app/:entityId` | Fetch a single row, or 404 |
+| DELETE | `/sync/:app/:entityId` | Soft-delete a row (sets a tombstone, advances seq) |
+
+`seq` is a server-assigned monotonic cursor per account. Clients page forward by
+passing the highest `seq` they have seen as `since`. `list` accepts `limit`
+(default 500, max 1000) and returns `hasMore: true` when rows remain past the
+returned page.
+
+### Hit the batch endpoint with curl
+
+```
+TOKEN=your-device-token
+ENVELOPE=$(head -c 32 /dev/urandom | base64)
+
+# Upsert two rows for account "house-1" under dayGLANCE.
+curl -s -X POST http://localhost:8080/sync/dayglance/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"accountId\":\"house-1\",\"rows\":[
+        {\"entityId\":\"task-1\",\"envelope\":\"$ENVELOPE\"},
+        {\"entityId\":\"task-2\",\"envelope\":\"$ENVELOPE\"}]}"
+# -> {"written":2,"maxSeq":2}
+
+# Pull everything since the start of time.
+curl -s "http://localhost:8080/sync/dayglance/list?accountId=house-1&since=0" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Soft-delete a row.
+curl -s -X DELETE "http://localhost:8080/sync/dayglance/task-1?accountId=house-1" \
+  -H "Authorization: Bearer $TOKEN"
+# -> {"seq":3}
+```
+
 ## Run from source (development)
 
 ```
@@ -116,3 +160,9 @@ This includes a unit test that hammers the per-account sequence counter from
 multiple worker threads sharing one SQLite file and asserts the assigned
 sequence numbers form a gap-free, duplicate-free run, proving bumps stay
 monotonic under concurrent writers.
+
+The sync transport has its own hammer suite (`test/sync.test.ts`) that drives
+the real HTTP endpoints against a real SQLite file with synthetic garbage-byte
+envelopes. It proves seq monotonicity under concurrent batch writes, batch
+idempotency, ON CONFLICT seq advancement, incremental fetch and `hasMore`
+correctness, soft-delete, and cross-app isolation.
