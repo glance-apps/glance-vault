@@ -29,6 +29,14 @@ export interface ListResult {
   hasMore: boolean;
 }
 
+// The key-derivation salt stored for an account. salt is an opaque base64
+// string; the server stores and returns it as-is and never decodes it.
+export interface SaltRecord {
+  accountId: string;
+  salt: string;
+  createdAt: string;
+}
+
 // Thin storage interface. Request handlers depend only on this interface, never
 // on a concrete database. SQLite is the only implementation in Phase 0; a
 // Postgres implementation can be added later by satisfying this same contract
@@ -76,6 +84,16 @@ export interface Store {
   // all in one transaction. Returns the new seq, or null if the row does not
   // exist.
   softDeleteRow(app: string, accountId: string, entityId: string): { seq: number } | null;
+
+  // Fetch the key-derivation salt for an account, or null if none is stored yet.
+  // The salt is an opaque base64 string the server never decodes.
+  getSalt(accountId: string): SaltRecord | null;
+
+  // Store the salt for an account if and only if none exists yet, then return
+  // whatever is stored. First-write-wins: an existing salt is never overwritten,
+  // and the returned value is always the stored one, not necessarily the
+  // supplied one. created is true when this call stored a new salt.
+  putSaltIfAbsent(accountId: string, salt: string): SaltRecord & { created: boolean };
 
   // Release underlying resources (database handle, etc.).
   close(): void;

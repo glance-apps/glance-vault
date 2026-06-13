@@ -7,6 +7,7 @@ import type {
   SyncRowRecord,
   BatchResult,
   ListResult,
+  SaltRecord,
 } from "./types.js";
 import { runMigrations, currentVersion } from "./migrations.js";
 
@@ -178,6 +179,38 @@ export class SqliteStore implements Store {
         )
         .run(seq, new Date().toISOString(), accountId, app, entityId);
       return { seq };
+    });
+  }
+
+  getSalt(accountId: string): SaltRecord | null {
+    const row = this.db
+      .prepare(`SELECT account_id, salt, created_at FROM account_salts WHERE account_id = ?`)
+      .get(accountId) as { account_id: string; salt: string; created_at: string } | undefined;
+    if (!row) {
+      return null;
+    }
+    return { accountId: row.account_id, salt: row.salt, createdAt: row.created_at };
+  }
+
+  // First-write-wins. INSERT OR IGNORE never overwrites an existing row, so a
+  // racing second writer for the same account is a no-op. Both steps run in one
+  // transaction and the value is read back AFTER the insert attempt, so the
+  // returned salt is always whatever is actually stored, never the supplied
+  // value. created reflects whether this call is the one that inserted, derived
+  // from the row's change count.
+  putSaltIfAbsent(accountId: string, salt: string): SaltRecord & { created: boolean } {
+    return this.transaction(() => {
+      const info = this.db
+        .prepare(
+          `INSERT OR IGNORE INTO account_salts (account_id, salt, created_at)
+           VALUES (?, ?, ?)`,
+        )
+        .run(accountId, salt, new Date().toISOString());
+      const stored = this.getSalt(accountId);
+      // getSalt cannot be null here: either this call inserted the row or one
+      // already existed. The non-null assertion documents that invariant.
+      const record = stored as SaltRecord;
+      return { ...record, created: info.changes > 0 };
     });
   }
 
