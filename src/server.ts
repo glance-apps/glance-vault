@@ -3,6 +3,7 @@ import type { Config } from "./config.js";
 import type { Store } from "./storage/types.js";
 import { deviceTokenAuth } from "./middleware/auth.js";
 import { healthRouter } from "./routes/health.js";
+import { syncRouter } from "./routes/sync.js";
 
 // Build the Express app. Kept separate from the listen() call in index.ts so it
 // can be constructed in tests without binding a port.
@@ -18,7 +19,9 @@ export function buildApp(config: Config, store: Store): Express {
 
   app.use(deviceTokenAuth(config.deviceToken));
 
-  // Protected routes (sync, intents, media) are added in later phases here.
+  // Protected routes. Phase 1 adds the sync transport. Intents and media land
+  // in later phases.
+  app.use("/sync", syncRouter(store));
 
   return app;
 }
