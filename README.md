@@ -3,9 +3,11 @@
 Optional self-hosted backend for the GLANCE apps: zero-knowledge sync,
 cross-device intents, and media storage.
 
-Status: Phase 1 (sync transport). The server builds, runs, holds the schema,
-authenticates a device token, and serves the sync transport endpoints. Intents
-and media endpoints are not implemented yet; those are later phases. See
+Status: Phase 1 complete (sync transport), plus the salt store that Phase 3
+(the client-side database transport) depends on. The server builds, runs, holds
+the schema, authenticates a device token, serves the sync transport endpoints,
+and stores one key-derivation salt per account. Intents and media endpoints are
+not implemented yet; those are later phases. See
 `docs/GLANCEvault-server-spec.md` for the full design and build plan.
 
 ## What Phase 0 includes
@@ -134,6 +136,39 @@ curl -s "http://localhost:8080/sync/dayglance/list?accountId=house-1&since=0" \
 curl -s -X DELETE "http://localhost:8080/sync/dayglance/task-1?accountId=house-1" \
   -H "Authorization: Bearer $TOKEN"
 # -> {"seq":3}
+```
+
+## Salt store
+
+The key-derivation salt lives as server state so any new device can derive the
+same root key from the passphrase. The salt is not secret: its only jobs are
+uniqueness and defeating precomputation, so storing it (even on an untrusted
+host) is safe because a salt without the passphrase is useless. The server keeps
+the salt as an opaque base64 string, stores no passphrase or derived key, and
+does no key derivation. Both endpoints require the device token.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/salt/:accountId` | Return the account's salt, or 404 if none is stored |
+| PUT | `/salt/:accountId` | Store the salt if absent, then return the stored salt |
+
+`PUT` is first-write-wins: if a salt already exists it is returned unchanged and
+the supplied value is ignored, so two devices racing to register a salt both end
+up with the same one. The response is `{ accountId, salt, createdAt, created }`,
+where `created` is true only when this call stored a new salt.
+
+```
+TOKEN=your-device-token
+SALT=$(head -c 16 /dev/urandom | base64)
+
+# Register the salt for account "house-1" (first writer wins).
+curl -s -X PUT http://localhost:8080/salt/house-1 \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"salt\":\"$SALT\"}"
+# -> {"accountId":"house-1","salt":"...","createdAt":"...","created":true}
+
+# Any device can fetch it.
+curl -s http://localhost:8080/salt/house-1 -H "Authorization: Bearer $TOKEN"
 ```
 
 ## Scripts
