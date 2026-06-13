@@ -136,6 +136,58 @@ curl -s -X DELETE "http://localhost:8080/sync/dayglance/task-1?accountId=house-1
 # -> {"seq":3}
 ```
 
+## Scripts
+
+### Phase 2 losslessness check
+
+`scripts/losslessness-check.ts` is a one-off, read-only dogfood script. It reads
+the current file-tier sync payload for each app, seeds a running GLANCEvault
+server, pulls the rows back out, and diffs the returned envelope bytes against
+the originals byte-for-byte. It is the centerpiece Phase 2 check: proof that the
+server round-trips real production data losslessly. It never decrypts anything,
+never modifies your WebDAV files or app data, and adds no server endpoints.
+
+It runs against a normal running server, so start the server first (see above),
+then run the script on the machine that holds the file-tier sync directories.
+
+Configuration is via environment variables (see `.env.phase2.example`):
+
+| Variable | What to put there |
+|---|---|
+| `VAULT_URL` | Base URL of the running server, e.g. `http://localhost:8080` |
+| `VAULT_TOKEN` | The device token the server was started with |
+| `ACCOUNT_ID` | Base account id for the check, e.g. `lossless-check` (a per-app suffix is added) |
+| `SYNC_DIR_DAYGLANCE` | Path to the dayGLANCE file-tier sync directory |
+| `SYNC_DIR_LASTGLANCE` | Path to the lastGLANCE file-tier sync directory |
+| `SYNC_DIR_LIFEGLANCE` | Path to the lifeGLANCE file-tier sync directory |
+
+```
+cp .env.phase2.example .env.phase2
+# edit .env.phase2 to set the token and the three sync directory paths
+set -a; . ./.env.phase2; set +a
+npx tsx scripts/losslessness-check.ts
+```
+
+The script seeds each app under its own account id (`lossless-check-dayglance`,
+and so on) so the check rows are easy to tell apart from real household data. It
+is idempotent: running it again produces the same result. If any environment
+variable is missing or any sync directory is absent or empty, it prints a clear
+per-item error and exits 1 before doing anything.
+
+A passing run ends like this and exits 0:
+
+```
+=== Summary ===
+dayglance: files=247 seeded=247 retrieved=247 mismatches=0 -> PASS
+lastglance: files=18 seeded=18 retrieved=18 mismatches=0 -> PASS
+lifeglance: files=130 seeded=130 retrieved=130 mismatches=0 -> PASS
+
+losslessness check PASSED: every app round-tripped byte-for-byte
+```
+
+Any mismatch or a retrieved count that does not equal the seeded count prints
+the offending entity ids and exits 1.
+
 ## Run from source (development)
 
 ```
