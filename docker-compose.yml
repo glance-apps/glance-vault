@@ -1,0 +1,48 @@
+# Production docker-compose for a self-hosted GLANCEvault.
+#
+# This pulls the prebuilt image from the GitHub Container Registry rather than
+# building locally. See docker-compose.example.yml for the build-from-source
+# variant. All three GLANCE apps (dayGLANCE, lastGLANCE, lifeGLANCE) point at
+# this one server.
+#
+# Quick start:
+#   1. Set GLANCEVAULT_DEVICE_TOKEN in a .env file next to this one (and
+#      optionally GLANCEVAULT_ALLOWED_ORIGINS). See .env.example.
+#   2. docker compose up -d
+#   3. curl http://localhost:8080/healthz
+#
+# Sit this behind a TLS-terminating reverse proxy in production (see the Caddy
+# stanza in the README). The port is bound to localhost by default so the server
+# is reached through the proxy rather than exposed directly.
+
+services:
+  glancevault:
+    image: ghcr.io/glance-apps/glance-vault:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Required: the single device auth token. Set it in .env.
+      GLANCEVAULT_DEVICE_TOKEN: ${GLANCEVAULT_DEVICE_TOKEN:?set GLANCEVAULT_DEVICE_TOKEN in your .env}
+      # Optional: comma-separated browser origins allowed for CORS. Empty by
+      # default, which permits no cross-origin requests.
+      GLANCEVAULT_ALLOWED_ORIGINS: ${GLANCEVAULT_ALLOWED_ORIGINS:-}
+      GLANCEVAULT_PORT: "8080"
+      GLANCEVAULT_STORAGE_PATH: /data/glancevault.db
+    volumes:
+      # Named volume holding the SQLite database file, so it survives restarts.
+      - glancevault-data:/data
+    healthcheck:
+      # Hit the public /healthz endpoint using the node runtime in the image.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  glancevault-data:

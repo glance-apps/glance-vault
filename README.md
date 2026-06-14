@@ -3,6 +3,15 @@
 Optional self-hosted backend for the GLANCE apps: zero-knowledge sync,
 cross-device intents, and media storage.
 
+[![Container image](https://img.shields.io/badge/ghcr.io-glance--apps%2Fglance--vault-2496ED?logo=docker&logoColor=white)](https://github.com/glance-apps/glance-vault/pkgs/container/glance-vault)
+
+```
+docker pull ghcr.io/glance-apps/glance-vault:latest
+```
+
+Images are published to the GitHub Container Registry on every push to `main`,
+tagged with both `latest` and the short commit SHA.
+
 Status: Phase 1 complete (sync transport), plus the salt store that Phase 3
 (the client-side database transport) depends on. The server builds, runs, holds
 the schema, authenticates a device token, serves the sync transport endpoints,
@@ -43,6 +52,14 @@ built-in defaults.
 | SQLite file path | `GLANCEVAULT_STORAGE_PATH` | `storagePath` | `./data/glancevault.db` |
 | Listen port | `GLANCEVAULT_PORT` | `port` | `8080` |
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
+| Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
+
+`GLANCEVAULT_ALLOWED_ORIGINS` is a comma-separated list of origins; the
+`allowedOrigins` config file field is an array. The environment variable wins
+over the file. When neither is set, no cross-origin requests are allowed. A
+single `*` entry allows any origin. Preflight OPTIONS requests are answered
+before auth, so browser clients work without sending the device token on the
+preflight.
 
 The config file path defaults to `./config.json` and can be overridden with
 `GLANCEVAULT_CONFIG`. See `config.example.json` and `.env.example`.
@@ -81,6 +98,41 @@ docker compose -f docker-compose.example.yml up --build
 
 The SQLite file lives on a named volume, so it survives restarts. On a fresh,
 empty volume the server runs migrations on boot and comes up working.
+
+## Deploy in production
+
+For a real deployment, use `docker-compose.yml`, which pulls the prebuilt image
+from `ghcr.io/glance-apps/glance-vault:latest` instead of building from source.
+It mounts a named volume for the SQLite file, sets `restart: unless-stopped`, and
+includes a healthcheck against `/healthz`.
+
+```
+cp .env.example .env
+# edit .env: set GLANCEVAULT_DEVICE_TOKEN, and GLANCEVAULT_ALLOWED_ORIGINS if
+# browser clients will connect cross-origin
+docker compose up -d
+docker compose ps        # STATUS shows "healthy" once the healthcheck passes
+curl http://localhost:8080/healthz
+```
+
+The server port is published on `127.0.0.1` only, so it is reached through a
+TLS-terminating reverse proxy rather than exposed directly. To pick up a new
+image after a push to `main`, run `docker compose pull && docker compose up -d`.
+
+### Behind Caddy
+
+Caddy gives you automatic HTTPS. A minimal `Caddyfile` stanza:
+
+```
+vault.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Then point the GLANCE apps at `https://vault.example.com`. If those apps run in a
+browser on a different origin, set `GLANCEVAULT_ALLOWED_ORIGINS` to their origins
+(for example `https://app.example.com`) so CORS permits them. The device token is
+sent in the `Authorization` header, so it rides over the proxy unchanged.
 
 ## Hit /healthz
 

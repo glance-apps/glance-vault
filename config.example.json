@@ -1,5 +1,6 @@
 {
   "storagePath": "./data/glancevault.db",
   "port": 8080,
-  "deviceToken": "replace-with-a-long-random-secret"
+  "deviceToken": "replace-with-a-long-random-secret",
+  "allowedOrigins": ["https://app.example.com"]
 }

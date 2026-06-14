@@ -21,7 +21,7 @@ async function startServer(): Promise<Harness> {
   const path = join(dir, "test.db");
   const store = new SqliteStore(path);
   store.migrate();
-  const app = buildApp({ storagePath: path, port: 0, deviceToken: TOKEN }, store);
+  const app = buildApp({ storagePath: path, port: 0, deviceToken: TOKEN, allowedOrigins: [] }, store);
   const server: Server = await new Promise((resolve) => {
     const s = app.listen(0, () => resolve(s));
   });
