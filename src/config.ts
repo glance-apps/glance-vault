@@ -12,12 +12,16 @@ export interface Config {
   port: number;
   // The single valid device auth token (a shared secret). Required.
   deviceToken: string;
+  // Origins allowed for browser CORS requests. Empty means no cross-origin
+  // requests are permitted. A single "*" entry allows any origin.
+  allowedOrigins: string[];
 }
 
 interface FileConfig {
   storagePath?: string;
   port?: number;
   deviceToken?: string;
+  allowedOrigins?: string[];
 }
 
 const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
@@ -61,5 +65,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
-  return { storagePath, port, deviceToken };
+  // Allowed CORS origins. The env var is a comma-separated list and takes
+  // precedence over the config file's allowedOrigins array. Absent both, no
+  // cross-origin requests are allowed.
+  const originsEnv = env.GLANCEVAULT_ALLOWED_ORIGINS;
+  let allowedOrigins: string[];
+  if (originsEnv !== undefined) {
+    allowedOrigins = splitOrigins(originsEnv);
+  } else if (Array.isArray(file.allowedOrigins)) {
+    allowedOrigins = file.allowedOrigins.map((o) => String(o).trim()).filter((o) => o !== "");
+  } else {
+    allowedOrigins = [];
+  }
+
+  return { storagePath, port, deviceToken, allowedOrigins };
+}
+
+function splitOrigins(value: string): string[] {
+  return value
+    .split(",")
+    .map((o) => o.trim())
+    .filter((o) => o !== "");
 }

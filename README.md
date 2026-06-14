@@ -52,6 +52,14 @@ built-in defaults.
 | SQLite file path | `GLANCEVAULT_STORAGE_PATH` | `storagePath` | `./data/glancevault.db` |
 | Listen port | `GLANCEVAULT_PORT` | `port` | `8080` |
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
+| Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
+
+`GLANCEVAULT_ALLOWED_ORIGINS` is a comma-separated list of origins; the
+`allowedOrigins` config file field is an array. The environment variable wins
+over the file. When neither is set, no cross-origin requests are allowed. A
+single `*` entry allows any origin. Preflight OPTIONS requests are answered
+before auth, so browser clients work without sending the device token on the
+preflight.
 
 The config file path defaults to `./config.json` and can be overridden with
 `GLANCEVAULT_CONFIG`. See `config.example.json` and `.env.example`.
