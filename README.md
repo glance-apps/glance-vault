@@ -99,6 +99,41 @@ docker compose -f docker-compose.example.yml up --build
 The SQLite file lives on a named volume, so it survives restarts. On a fresh,
 empty volume the server runs migrations on boot and comes up working.
 
+## Deploy in production
+
+For a real deployment, use `docker-compose.yml`, which pulls the prebuilt image
+from `ghcr.io/glance-apps/glance-vault:latest` instead of building from source.
+It mounts a named volume for the SQLite file, sets `restart: unless-stopped`, and
+includes a healthcheck against `/healthz`.
+
+```
+cp .env.example .env
+# edit .env: set GLANCEVAULT_DEVICE_TOKEN, and GLANCEVAULT_ALLOWED_ORIGINS if
+# browser clients will connect cross-origin
+docker compose up -d
+docker compose ps        # STATUS shows "healthy" once the healthcheck passes
+curl http://localhost:8080/healthz
+```
+
+The server port is published on `127.0.0.1` only, so it is reached through a
+TLS-terminating reverse proxy rather than exposed directly. To pick up a new
+image after a push to `main`, run `docker compose pull && docker compose up -d`.
+
+### Behind Caddy
+
+Caddy gives you automatic HTTPS. A minimal `Caddyfile` stanza:
+
+```
+vault.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Then point the GLANCE apps at `https://vault.example.com`. If those apps run in a
+browser on a different origin, set `GLANCEVAULT_ALLOWED_ORIGINS` to their origins
+(for example `https://app.example.com`) so CORS permits them. The device token is
+sent in the `Authorization` header, so it rides over the proxy unchanged.
+
 ## Hit /healthz
 
 ```
