@@ -3,6 +3,15 @@
 Optional self-hosted backend for the GLANCE apps: zero-knowledge sync,
 cross-device intents, and media storage.
 
+[![Container image](https://img.shields.io/badge/ghcr.io-glance--apps%2Fglance--vault-2496ED?logo=docker&logoColor=white)](https://github.com/glance-apps/glance-vault/pkgs/container/glance-vault)
+
+```
+docker pull ghcr.io/glance-apps/glance-vault:latest
+```
+
+Images are published to the GitHub Container Registry on every push to `main`,
+tagged with both `latest` and the short commit SHA.
+
 Status: Phase 1 complete (sync transport), plus the salt store that Phase 3
 (the client-side database transport) depends on. The server builds, runs, holds
 the schema, authenticates a device token, serves the sync transport endpoints,
