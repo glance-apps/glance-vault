@@ -381,6 +381,45 @@ on full server ack. On any failure, keep the dirty set and retry. Never mark
 clean optimistically. Un-acked rows stay dirty and are re-sent idempotently
 next cycle.
 
+### 6.5 Push trigger (push-on-write, not cadence-only)
+
+A local write must trigger a debounced push (roughly 2 to 5 seconds), not
+only ride the periodic sync interval. Interval-only delivery is a correctness
+defect, not just a latency one: browsers and WebView shells heavily throttle
+or suspend background-tab timers, so a backgrounded source device may not hit
+its interval for a long time, and dirty rows sit undelivered until something
+else (app reopen, tab focus) forces a cycle. This was observed in the
+lastGLANCE GLANCEvault test: completions logged on a backgrounded desktop did
+not reach the vault (and therefore did not reach a vault-only iPad) until the
+desktop app was reopened.
+
+Requirements:
+
+- Writes mark rows dirty AND schedule a debounced push; the push is not
+  contingent on the interval tick.
+- The interval remains as a backstop for catch-up and for delivering anything
+  a missed push left behind, but it is not the primary delivery path.
+- The push-on-write must fire for every active transport. On a dual-transport
+  device (e.g. a cutover-window device writing to both WebDAV and GLANCEvault),
+  it drives both so the two transports do not drift apart on independent
+  cadences.
+
+Where this lives: the row protocol and merge logic are in `@glance-apps/sync`,
+but cadence and triggers (the interval, visibility/focus listeners, and this
+debounced push-on-write) currently live in each app's own integration layer,
+not in the package. The package is deliberately mechanism, not policy. So the
+fix is applied per app, not once in the shared engine, which is exactly why
+the per-app requirement below exists. Hoisting trigger policy into the shared
+package is an option if the three apps' trigger logic turns out identical and
+the duplication becomes annoying, but it is not required and would couple all
+three apps to one cadence implementation. Default: keep triggers app-side.
+
+This requirement applies to every app as it adopts GLANCEvault (lastGLANCE,
+then dayGLANCE, then lifeGLANCE), not just the first. Because triggers are
+app-side, the fix does NOT propagate automatically; each cutover must
+re-apply and confirm push-on-write, or the cutover is not actually proven:
+a test that looks clean can still be stranding writes until app reopen.
+
 ## 7. Intents Transport
 
 When a user enables GLANCEvault, cross-device intents move to the server
