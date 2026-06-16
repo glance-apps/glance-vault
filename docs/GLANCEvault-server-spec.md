@@ -100,7 +100,7 @@ it. It does not design the paid hosted product.
    Nextcloud/WebDAV endpoint when they first enable backend sync; intents
    still need it until the global intents cutover (Phase 6). The
    single-endpoint benefit arrives at Phase 6, not when the backend is first
-   enabled. (See section 11 for why intents cannot move per-app: they are the
+   enabled. (See section 12 for why intents cannot move per-app: they are the
    cross-app channel between the very apps being cut over one at a time.)
 
 7. Local-first: the backend is a sync and replication target, NOT the system
@@ -621,7 +621,44 @@ it is correct only for the convention-based placeholder values.
   GC'd. Detail the safe-delete timing (analogous to tombstone GC, accounting
   for devices that have not yet seen a reference removal) at the media phase.
 
-## 10. Related Client Bugs (context, fixed separately)
+## 10. Remote Backup
+
+Remote backup is NOT part of the sync design; it is an orthogonal concern, and
+GLANCEvault changes who owns it. Backup is a point-in-time durable copy for
+disaster recovery; sync is continuous multi-device convergence. They answer
+different questions.
+
+GLANCEvault is all-or-nothing per household (decision 6: tier is
+instance-level), so the backup story splits cleanly along the same line:
+
+- File-tier users KEEP app-level remote backup. They have no server, so the
+  in-app backup to a file destination is still their only durable off-device
+  copy. Unchanged.
+- GLANCEvault users: app-level remote backup is killed. The server already
+  holds a complete, current, encrypted copy of all household state, so it IS
+  the durable off-device copy. Backing it up is the operator's job, standard
+  server ops: it is one SQLite file (use Litestream for continuous replication
+  to object storage, or a file copy) or a Postgres dump (`pg_dump`). Anyone
+  running a container is expected to back up their own database; re-introducing
+  an in-app WebDAV backup would resurrect the exact file-tier dependency the
+  backend retires. So for backend users the in-app backup feature goes dormant
+  and backup becomes a server-ops task, which also simplifies their mental
+  model: the container holds everything, back up its volume, done.
+
+Zero-knowledge carries through for free, as long as the backup operates on the
+STORED layer. The database holds ciphertext (the Phase 2.7 envelopes), so a
+database backup, a Litestream replica, or a `pg_dump` is also ciphertext and
+can be shipped to any object store without leaking anything. The passphrase
+never leaves the clients. Do not design a "backup" that decrypts first.
+
+Note on what the server does and does not protect against: the server reduces
+but does not eliminate backup's value even for backend users. It is a single
+point of failure (hence the operator backing up its volume), and corruption
+introduced on a client syncs TO the server, so the server copy is not immune
+to a client-side data bug. Operator-side database backups (especially
+point-in-time replication like Litestream) cover both cases.
+
+## 11. Related Client Bugs (context, fixed separately)
 
 Surfaced by the sync audit, fixed ahead of the backend, in current shipping
 code, because they affect file-tier users today:
@@ -634,7 +671,7 @@ code, because they affect file-tier users today:
 - lastGLANCE: category and chore reorders wrote `sort_order` without bumping
   `updated_at`. Fix: bump `updated_at` on reorder.
 
-## 11. Build Phases
+## 12. Build Phases
 
 Phases 0 through 2 prove the server on real data before any app code changes,
 because the server stores opaque bytes and cannot tell real ciphertext from
@@ -731,7 +768,7 @@ Reversibility discipline: never delete a file-tier payload until its app has
 run clean on the server for real. Any surprise is then a one-line revert to
 the old transport.
 
-## 12. Deferred / Out of Scope (recorded so it is not lost)
+## 13. Deferred / Out of Scope (recorded so it is not lost)
 
 - Paid hosted product: billing, sign-up, multi-tenant separation of untrusted
   users. The hosted version would scope multiple households via `account_id`,
