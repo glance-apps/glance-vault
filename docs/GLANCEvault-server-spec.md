@@ -48,8 +48,7 @@ it. It does not design the paid hosted product.
   must never sync.
 - lifeGLANCE Lives: a `life_id` attribute lives INSIDE the encrypted
   envelope on lifeGLANCE entities, invisible to the server exactly like user
-  assignments and entity types. Lives need zero schema change. (Per-Life
-  export-as-artifact is a v3.0 client concern, independent of sync.)
+  assignments and entity types. Lives need zero schema change.
 
 ## 2. Key Decisions and Rationale
 
@@ -137,20 +136,34 @@ namespaces each app's rows in the shared tables. For self-hosters this is the
 same Docker deployment model they already use for dayGLANCE, so bundling the
 backend into the same compose adds no new operational muscle.
 
-### 3.2 Three tiers behind one interface
+### 3.2 Tiers behind one interface
 
-| Tier | Backend | Cursor | Dedupe | Reads | Push | Media |
-|---|---|---|---|---|---|---|
-| File | WebDAV, iCloud Drive | synthetic (time + filename) | client-side | list-and-filter | no | no |
-| Serverless | Vercel + Postgres + object storage | real `seq` | server-side | indexed incremental | no | yes |
-| Always-on | self-hosted container | real `seq` | server-side | indexed incremental | yes (SSE/WS) | yes |
+Two tiers ship: the file tier (frozen, simple) and the always-on container
+(the full-featured backend). A serverless tier is supported by the
+architecture but is NOT shipped or documented for now (see note below).
 
-All three satisfy the same client transport interface. Clients branch on a
-capability flag, never on backend identity. Most "rich" features need only a
-database, not a live connection; only push (and media streaming) require an
-always-on process. This is why a Vercel deploy is a real upgrade over the
-file tier and not merely "WebDAV again," even though it polls rather than
-pushes.
+| Tier | Backend | Cursor | Dedupe | Reads | Push | Media | Shipped |
+|---|---|---|---|---|---|---|---|
+| File | WebDAV, iCloud Drive | synthetic (time + filename) | client-side | list-and-filter | no | no | yes |
+| Always-on | self-hosted container | real `seq` | server-side | indexed incremental | yes (SSE/WS) | yes | yes |
+| Serverless | Vercel/Lambda + Postgres + object storage | real `seq` | server-side | indexed incremental | no | yes | no (architecture-supported) |
+
+All tiers satisfy the same client transport interface. Clients branch on a
+capability flag, never on backend identity.
+
+Serverless tier, deferred not cancelled: a serverless deploy (functions plus
+managed Postgres plus object storage) is a coherent target, and the storage
+and blob abstractions are kept tier-agnostic so it remains buildable later
+with no rework. It is dropped from the near-term build and rollout for two
+reasons. First, the audience asking for a self-hosted backend runs containers
+almost by definition, so the no-hardware serverless user was always more
+adjacent than core. Second, serverless cannot do push (short-lived functions
+do not hold persistent connections), so it would be a polling-only tier
+needing its own parity story. The same tier-agnostic abstractions that would
+enable a serverless deploy also enable a future paid hosted Postgres product,
+so keeping them costs nothing and preserves both options. The Vercel deploy
+guide is not written for now; if a paid product or a serverless guide is ever
+justified, the architecture already supports it.
 
 ### 3.3 Transport interface (already defined)
 
@@ -173,7 +186,7 @@ interface GlanceTransport {
 }
 
 interface TransportCapabilities {
-  push: boolean;           // SSE/WebSocket. File and Vercel: false
+  push: boolean;           // SSE/WebSocket. File: false; container: true (Phase 9)
   serverSequence: boolean; // server assigns ordering. File: false
   serverDedupe: boolean;   // server rejects dup entityId. File: false
   presence: boolean;
@@ -215,11 +228,15 @@ without eliminating key derivation, which (per decision 5) is not an option.
 
 ## 4. First-Class Capabilities (build-toward reference)
 
-What the database backend offers that the file tier cannot. Split by tier,
-because some need only a database (so they also work on Vercel) and some need
-the always-on container.
+What the backend offers that the file tier cannot. Split into two groups by
+what each capability requires: most need only a database (a query inside one
+request), and a few need a persistent connection on the always-on container.
+The container is the shipped backend tier, so in practice it provides all of
+these. The split is retained because it also marks what a future serverless
+or paid-hosted Postgres deploy could and could not offer: the database group
+would carry over, the persistent-connection group would not.
 
-### Database-tier (self-hosted container AND Vercel/Postgres)
+### Needs only a database (container today; a serverless/Postgres deploy too)
 
 - Server-assigned monotonic `seq`: deterministic, skew-proof ordering, which
   retires the fragile client-side `stampTaskTimestamps` mechanism.
@@ -236,11 +253,11 @@ the always-on container.
   sync, reference-counted cleanup (see section 8).
 - Server-enforced TTL on intents, so expiry is not a client chore.
 
-### Always-on-tier only (self-hosted container, not Vercel)
+### Needs a persistent connection (always-on container only)
 
 - Real-time push (SSE/WebSocket): instant sync and instant cross-app intents
   instead of polling. This is what makes the suite feel alive, a dayGLANCE
-  completion lighting up lastGLANCE immediately.
+  completion lighting up lastGLANCE immediately. Built in Phase 9.
 - Presence: live awareness of other household devices (the `presence`
   capability flag).
 - Media streaming with range requests rather than download-then-play.
@@ -627,8 +644,20 @@ exercising them needs two apps on the backend. Media (Phase 7) lands right
 before the lifeGLANCE cutover (Phase 8), since media is not relevant until
 lifeGLANCE. Both are deliberately kept out of the high-risk sync engine work
 (Phase 3) since they are lower-risk additions. App cutover order is
-lastGLANCE, then dayGLANCE, then lifeGLANCE, so that Lives are established
-before lifeGLANCE moves.
+lastGLANCE, then dayGLANCE, then lifeGLANCE.
+
+The lifeGLANCE cutover is gated on MEDIA (Phase 7), not on Lives. lifeGLANCE
+is the media app, and lifeGLANCE-on-backend-without-media would be a confusing
+half-state, so it cuts over all at once (structured sync plus media together).
+The cutover is deliberately NOT gated on the Lives feature: the goal is to
+ship GLANCEvault across the suite before the large Lives effort begins.
+When Lives lands later, it adds an in-envelope `life_id` attribute, which is
+additive and syncs automatically through the field-agnostic merge with no
+backend change and no re-cutover. This is the same move already proven when
+`media_id`/`photo_id`/`thumbnail_id` were added to lifeGLANCE milestones (see
+section 8.2). The one thing to watch is not `life_id` itself but whatever else
+a big Lives effort touches; landing that on a live backend rather than the
+file tier is a known, accepted tradeoff of shipping the backend first.
 
 Why intents cannot move per-app, and what runs during the transition: intents
 are the cross-app channel between dayGLANCE and lastGLANCE. If sync moved an
@@ -663,10 +692,12 @@ over-engineered to the sync cutover's standard.
   Read-only against real production data; the apps never touch the server.
 - Phase 3: DB sync transport in the client, behind the existing interface,
   selectable (not a replacement). Includes the engine rewrite (per-entity
-  dirty tracking, seq-mismatch reconciliation, partial-write safety) and the
-  per-row crypto change (one envelope per row, salt fetched from the server).
-  The heart of the project and the main risk. File tier stays intact as
-  fallback.
+  dirty tracking, seq-mismatch reconciliation, partial-write safety,
+  push-on-write per section 6.5) and the per-row crypto change (one envelope
+  per row, salt fetched from the server). The heart of the project and the
+  main risk. Delivery is POLLING here (cursor-based incremental reads); real-
+  time server push is deliberately deferred to Phase 9 so it does not bloat
+  this already-hard, already-risky phase. File tier stays intact as fallback.
 - Phase 4: Cut over lastGLANCE sync first (lower stakes, cleaner data model,
   insert-only completions already). Retain the file-tier payload untouched as
   backup. Run real multi-device for a week or two.
@@ -674,19 +705,27 @@ over-engineered to the sync cutover's standard.
   posture: retain the file payload, delete nothing.
 - Phase 6: Intents transport. Implement the database intents transport in
   `@glance-apps/intents` (insert-only writes to `intent_events`, cursor
-  delivery, push on the always-on tier), feature-detected and dual with the
-  file tier. With both apps on database sync, exercise cross-app intents end
-  to end. Migrate the intents salt to server state.
-- Phase 7: Media blob store. Server-side blob storage (abstracted: local disk
-  for the container, object storage for serverless), presigned-style byte
-  transfer, content-addressed dedup, reference-counted GC, the blob table,
-  and the client-side reference, thumbnail generation, and selective caching.
-- Phase 8: Cut over lifeGLANCE sync (after Lives are established in the app),
-  with milestone media via the Phase 7 blob store. Same retain-the-file-
-  payload posture.
-- Phase 9: Demote the file tier to the frozen tier for bring-your-own-
-  Nextcloud self-hosters. Write the Vercel deploy guide against the proven
-  server.
+  delivery), feature-detected and dual with the file tier. With both apps on
+  database sync, exercise cross-app intents end to end. Migrate the intents
+  salt to server state. (Real-time push for intents is added in Phase 9 along
+  with push for sync; until then intents deliver by polling the cursor.)
+- Phase 7: Media blob store. Server-side blob storage (abstracted behind a
+  storage interface: local disk for the container today, object storage if a
+  serverless or hosted deploy is built later), presigned-style byte transfer,
+  content-addressed dedup, reference-counted GC, the blob table, and the
+  client-side reference, thumbnail generation, and selective caching.
+- Phase 8: Cut over lifeGLANCE, structured sync and milestone media together
+  via the Phase 7 blob store (gated on media, not on the Lives feature). Same
+  retain-the-file-payload posture as the other cutovers.
+- Phase 9: File-tier demotion AND real-time push. Two parts. (a) Demote the
+  file tier to the frozen tier for bring-your-own-Nextcloud and iCloud
+  self-hosters. (b) Add real-time push (SSE/WebSocket) on the always-on
+  container for both sync and intents, replacing polling as the primary
+  delivery on that tier: a change on one device pushes to others instantly,
+  and cross-app intents arrive immediately. This is layered on the proven
+  polling foundation as an enhancement, which is why it lands last rather than
+  in Phase 3. Polling remains the reconnect/catch-up backstop. (No Vercel
+  deploy guide for now; see section 3.2.)
 
 Reversibility discipline: never delete a file-tier payload until its app has
 run clean on the server for real. Any surprise is then a one-line revert to
@@ -696,111 +735,15 @@ the old transport.
 
 - Paid hosted product: billing, sign-up, multi-tenant separation of untrusted
   users. The hosted version would scope multiple households via `account_id`,
-  each still internally trusted.
+  each still internally trusted. Gated on the apps earning enough to justify
+  the build and operating cost; not a near-term decision. Note: a paid tier
+  run on the SAME always-on container architecture preserves real-time push
+  for free (it is the identical server plus an operations and billing layer).
+  The push capability is free; push at multi-tenant scale (many persistent
+  connections, horizontal scaling of stateful connections) is the part that
+  takes real engineering, and it defers with the rest of the paid product.
 - Real authentication system: multi-tenant registration and credential
   storage. Near-term, device-to-server auth for a single-user self-hosted
   instance is a config-file token, not a system.
-- Per-Life export-as-artifact (lifeGLANCE v3.0): the memorial/gift use cases
-  may imply a per-Life encryption boundary rather than one household key.
-  This is a client-side export concern, independent of the sync backend, and
-  is fleshed out later.
 - Tier downgrade (backend to file tier) with existing media: an edge case,
   since media cannot exist on the file tier. Out of scope for now.
-
----
-
-## Milestone 0 Code Prompt
-
-```
-Stand up a new standalone server for GLANCEvault. This is Phase 0 only:
-skeleton, schema, health check, device-token auth, containerized. It should
-build, run, hold tables, and authenticate a device token. It does NOT yet
-implement sync, intents, or media endpoints (those are later phases).
-
-Work in a NEW repository (suggested name: glancevault), separate from the app
-repos. Use main as the working branch and do the work on a feature branch off
-main, then commit so I can sync state across Claude desktop and Code.
-Throwaway branch is fine.
-
-Stack: pick a small, boring, well-supported stack suited to a single-binary
-or single-container self-hosted server (Node/TypeScript or Go are both fine;
-choose one and justify in one line). SQLite as the storage backend for this
-phase. Keep storage access behind a thin interface so Postgres can be added
-later without touching handlers.
-
-Build:
-
-1. Schema and migrations for three tables, exactly as below. envelope is an
-   opaque byte column; the server never parses it.
-
-   sync_rows:
-     account_id   TEXT      NOT NULL   -- household/instance scope
-     app          TEXT      NOT NULL   -- e.g. 'dayglance', 'lastglance', 'lifeglance'
-     entity_id    TEXT      NOT NULL   -- stable client UUID
-     seq          INTEGER   NOT NULL   -- server-assigned monotonic per account
-     envelope     BLOB      NOT NULL   -- opaque encrypted bytes
-     deleted      INTEGER   NOT NULL DEFAULT 0
-     server_mtime TEXT      NOT NULL   -- ISO timestamp
-     PRIMARY KEY (account_id, app, entity_id)
-   Index on (account_id, app, seq).
-
-   intent_events:
-     account_id   TEXT      NOT NULL
-     event_id     TEXT      NOT NULL   -- client UUID
-     seq          INTEGER   NOT NULL   -- server-assigned monotonic per account
-     envelope     BLOB      NOT NULL   -- opaque encrypted bytes
-     expires_at   TEXT      NOT NULL   -- ISO timestamp, TTL
-     server_mtime TEXT      NOT NULL
-     PRIMARY KEY (account_id, event_id)
-   Index on (account_id, seq).
-
-   devices:
-     account_id    TEXT    NOT NULL
-     device_id     TEXT    NOT NULL
-     last_seen_seq INTEGER NOT NULL DEFAULT 0
-     last_active   TEXT    NOT NULL
-     PRIMARY KEY (account_id, device_id)
-
-2. A per-account monotonic seq source (e.g. a counter row or table) bumped
-   inside the same transaction as a write. Not used yet, but build the helper
-   and unit-test that concurrent bumps stay monotonic.
-
-3. Config loaded from a file and/or env: storage path, listen port, and a
-   single device auth token (a shared secret). No registration, no user
-   model, no multi-tenant logic.
-
-4. Device-token auth middleware: requests present the token (Authorization
-   header, Bearer), middleware rejects anything else with 401. Single valid
-   token from config is enough for this phase.
-
-5. GET /healthz returning 200 with a small JSON body (status, version,
-   schema version). No auth required on this endpoint.
-
-6. Dockerfile and a docker-compose example that runs the server with a
-   mounted volume for the SQLite file and the token supplied via env. It must
-   start clean on an empty volume (run migrations on boot). The compose
-   example should reflect that all three GLANCE apps will point at this one
-   server.
-
-7. A README section: how to configure the token, run via compose, and hit
-   /healthz. Follow the no-em-dash convention in all docs and comments.
-
-Do NOT:
-- Implement any sync, intents, or media endpoints. Those are later phases.
-- Add a media/blob table in this phase. Its design is not finalized.
-- Implement any crypto, key handling, salt storage, or envelope parsing. The
-  server treats envelope as opaque bytes forever.
-- Add any user registration, account creation, billing, or multi-tenant
-  separation. account_id is just a column for now.
-- Add SSE/WebSocket/push.
-- Add Postgres in this phase, but keep the storage interface clean enough
-  that adding it later does not touch request handlers.
-- Use em dashes anywhere in code comments, docs, or commit messages.
-
-Deliver:
-- The feature branch committed, with a short commit per logical piece
-  (schema/migrations, seq helper, auth + health, docker).
-- A one-paragraph summary: stack chosen and why, how to run it, and
-  confirmation that /healthz works on a fresh empty volume.
-- Confirm the seq monotonicity unit test passes.
-```
