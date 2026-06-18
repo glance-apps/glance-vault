@@ -328,7 +328,81 @@ The insert-only strategy is the structurally correct fix for the
 `completedDates` and GTD-exception collisions. lastGLANCE already uses this
 shape for CompletionEvents; dayGLANCE should move toward it.
 
-### 5.2 SQLite vs Postgres
+### 5.2 Entity discrimination: structural sniff vs explicit `_kind`
+
+The adapter has to know what kind of entity a decrypted row is, because the
+server stores no type column (entity_type is deliberately not a column; see
+section 5 notes). Two approaches, and the right one depends on the app:
+
+- Structural sniff (lastGLANCE): derive kind from the decrypted shape's field
+  names, with a load-bearing check order. Works only when entity shapes are
+  distinct. lastGLANCE has four well-separated types, so this is sufficient
+  there.
+- Explicit in-envelope `_kind` (dayGLANCE): carry a `_kind` field inside the
+  entity. Required when shapes are not distinguishable. dayGLANCE's
+  `tasks`, `unscheduledTasks`, `recurringTasks`, `recycleBin`, and
+  `todayRoutines` are the IDENTICAL task shape (all stamped through one
+  `stampTaskTimestamps`), so a structural sniff cannot separate scheduled vs
+  inbox vs today-routine. dayGLANCE therefore carries `_kind` and uses a
+  composite `${kind}:${id}` entityId. Because the envelope is JSON-stringified
+  before AES-GCM, `_kind` is sealed inside the ciphertext and the server never
+  sees it: still zero-knowledge.
+
+Guidance: entity-rich apps (dayGLANCE, and lifeGLANCE later) should default to
+explicit `_kind` rather than structural sniffing. The sniff is a lastGLANCE
+convenience that does not generalize. `_kind` is the durable pattern.
+
+Composite entityId caveat: keying by `${kind}:${id}` means the same logical
+record under two kinds is two different rows. For records that MOVE between
+kinds (e.g. a dayGLANCE task moving unscheduled -> scheduled -> recycle bin,
+keeping its `id`), a move must be represented as a tombstone on the old
+`${kind}:${id}` plus an insert on the new one, or the record can end up live
+under two rows (appearing in two lists). This is a real cross-list
+reconciliation requirement on the apply/merge path, not a representability
+problem (the losslessness roundtrip does not exercise it).
+
+### 5.3 Bundle rows and merge granularity (silent-loss risk)
+
+Some app state does not decompose into per-item rows with their own
+timestamps. dayGLANCE has several such bundles: `routineDefinitions`,
+`habitLogs`, `habitLogTimestamps`, `routineCompletions`, `completedTaskUids`,
+the tombstone maps, and the paired `*Enabled`/`*UpdatedAt` flags. Mapping each
+bundle as a SINGLE row is lossless for one device, but the row merges by
+entity-grain last-writer-wins, so two devices editing DIFFERENT entries in the
+same bundle between syncs produce two versions of that one row and LWW
+discards one. That is silent data loss on concurrent edits, the same shape as
+the `completedDates` collision generalized across every bundle.
+
+A single-device losslessness test cannot catch this; it only appears with
+concurrent multi-device edits. So each bundle row needs a deliberate merge
+decision, not a default upsert:
+
+- Bundles with per-key timestamps (e.g. `habitLogTimestamps` exists precisely
+  so habit logs can be merged by recency) should merge key-by-key using those
+  timestamps, not LWW the whole row.
+- Bundles without per-key timestamps need either a merge strategy added
+  (set-union for append-only maps like `completedTaskUids` and tombstone maps,
+  which only grow) or an honest acknowledgement of the LWW loss window.
+- The apply step for these rows is therefore special (map-merge), not a plain
+  upsert. This is app-side adapter logic, not a server or `@glance-apps/sync`
+  change.
+
+Convergence requires re-pushing the merged superset, not apply-step merge
+alone. The vault stores one row per entityId, upserted last-write-wins, and
+two devices editing different entries in the same bundle row clobber each
+other AT THE VAULT before either reads the other's value, so merging only on
+apply cannot recover the lost entry. The fix (proven in the dayGLANCE cutover,
+borrowed from the file tier's `remoteChanged` mechanism): when a bundle merge
+leaves a device richer than the row it just pulled, the device re-pushes the
+merged superset. Because the per-bundle merges are commutative and monotonic
+(set-union, per-key max-timestamp), this converges and terminates. Any bundle
+whose merge is NOT monotonic would not be safe under this scheme and must be
+flagged rather than shipped. The dayGLANCE cutover found no such bundle.
+
+This is the core merge-correctness work of the dayGLANCE cutover and must be
+proven with a multi-device test before going live.
+
+### 5.4 SQLite vs Postgres
 
 The only real divergence is `seq` assignment. SQLite serializes all writes
 through a single writer, so a per-account counter bumped inside the same
@@ -444,6 +518,43 @@ then dayGLANCE, then lifeGLANCE), not just the first. Because triggers are
 app-side, the fix does NOT propagate automatically; each cutover must
 re-apply and confirm push-on-write, or the cutover is not actually proven:
 a test that looks clean can still be stranding writes until app reopen.
+
+### 6.6 Cursor invariant (the pull cursor advances only on pull)
+
+This is a hard correctness invariant of the sync engine, fixed in
+`@glance-apps/sync` 1.4.0. It must not regress.
+
+The pull cursor (the `since` value, the high-water mark for reads) means "the
+highest seq I have actually consumed." A push consumes nothing, so a push MUST
+NOT advance the pull cursor. Push tracks its own progress in a SEPARATE
+push-ack marker.
+
+Why this matters: the server assigns pushed rows the highest seqs in the
+account. If a push advances the shared pull cursor to the seq it just wrote
+(the pre-1.4.0 bug), the next pull lists only rows above that, and any remote
+row written by another device but not yet pulled sits below the cursor and is
+permanently skipped. For mutable entities a later rewrite can converge, but
+insert-only rows (completion events, the core lastGLANCE data) are never
+rewritten and are lost forever. This was a live data-loss bug; the fix splits
+the pull cursor from the push-ack marker so push can never move the pull
+cursor.
+
+Consequences that follow from the invariant:
+
+- Cycle ordering (push-then-pull vs pull-then-push) no longer affects
+  correctness, because the pull always lists from the highest seq it has truly
+  consumed regardless of what push did. lastGLANCE keeps the engine default
+  (push-then-pull); dayGLANCE composes pull-then-push for an unrelated reason
+  (its wrapper commits a React-state mirror only on success). Pull-then-push
+  is therefore an OPTIONAL marginal-freshness choice, NOT a data-loss
+  mitigation. Do not re-introduce an app-side reorder believing it guards
+  against the cursor bug; the package guards against it.
+- On upgrade, an existing stored cursor is read as pull-progress (the
+  conservative reading: a device never resumes ahead of what it consumed). No
+  migration step. Note: the fix stops FUTURE skips; rows already permanently
+  skipped before the upgrade are not recovered by it. A one-time forced
+  re-pull from seq 0 (idempotent for insert-only apply) is the way to true up
+  a device suspected of missing pre-fix data.
 
 ## 7. Intents Transport
 
