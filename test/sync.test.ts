@@ -61,7 +61,7 @@ async function postBatch(
   base: string,
   app: string,
   accountId: string,
-  rows: Array<{ entityId: string; envelope: string; deleted?: boolean }>,
+  rows: Array<{ entityId: string; envelope: string; deleted?: boolean; insertOnly?: boolean }>,
 ): Promise<{ status: number; body: { written: number; maxSeq: number } }> {
   const res = await fetch(`${base}/sync/${app}/batch`, {
     method: "POST",
@@ -69,6 +69,18 @@ async function postBatch(
     body: JSON.stringify({ accountId, rows }),
   });
   return { status: res.status, body: (await res.json()) as { written: number; maxSeq: number } };
+}
+
+async function getRow(
+  base: string,
+  app: string,
+  accountId: string,
+  entityId: string,
+): Promise<{ status: number; body: WireRow | { error: string } }> {
+  const url = new URL(`${base}/sync/${app}/${encodeURIComponent(entityId)}`);
+  url.searchParams.set("accountId", accountId);
+  const res = await fetch(url, { headers: authHeaders() });
+  return { status: res.status, body: (await res.json()) as WireRow | { error: string } };
 }
 
 async function listRows(
@@ -399,6 +411,87 @@ test("apps are isolated within an account", async () => {
       headers: authHeaders(),
     });
     assert.equal(bad.status, 400, "unknown app is rejected");
+  } finally {
+    h.close();
+  }
+});
+
+// 7. Key-verifier (sync >= 1.5.0): the client reads a reserved row
+// "__glance_keycheck" once per session to validate the passphrase before
+// syncing. A missing verifier MUST be 404 (the client treats 404 as "new
+// account" and then writes the verifier), never 400 -- reserved "__glance_*"
+// ids are opaque, client-chosen strings and must not be format-rejected.
+const KEYCHECK = "__glance_keycheck";
+
+test("GET of a non-existent key-verifier row returns 404, not 400", async () => {
+  const h = await startServer();
+  try {
+    const got = await getRow(h.base, "dayglance", "acct-keycheck-new", KEYCHECK);
+    assert.equal(got.status, 404, "a new account's verifier read is 404, never 400");
+  } finally {
+    h.close();
+  }
+});
+
+test("the key-verifier writes via batch and then reads back and lists", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-keycheck-write";
+    const envelope = garbageEnvelope();
+
+    // The client writes the verifier via batch with insertOnly.
+    const write = await postBatch(h.base, "dayglance", account, [
+      { entityId: KEYCHECK, envelope, insertOnly: true },
+    ]);
+    assert.equal(write.status, 200, "the reserved id is accepted on batch, not 400");
+    assert.equal(write.body.written, 1);
+
+    // The single-row GET now returns 200 with the verifier.
+    const got = await getRow(h.base, "dayglance", account, KEYCHECK);
+    assert.equal(got.status, 200);
+    const row = got.body as WireRow;
+    assert.equal(row.entityId, KEYCHECK);
+    assert.equal(row.envelope, envelope, "the stored verifier envelope is returned intact");
+    assert.equal(row.deleted, false);
+    assert.ok(typeof row.seq === "number");
+
+    // It is stored and returned like any other row, so it also appears in list.
+    const listed = await listRows(h.base, "dayglance", account, 0);
+    const found = listed.body.rows.find((r) => r.entityId === KEYCHECK);
+    assert.ok(found, "the verifier appears in list like any other row");
+    assert.equal(found?.envelope, envelope);
+  } finally {
+    h.close();
+  }
+});
+
+test("a second insertOnly write of the key-verifier does not overwrite it", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-keycheck-firstwins";
+    const original = garbageEnvelope();
+    const other = garbageEnvelope();
+    assert.notEqual(original, other);
+
+    const first = await postBatch(h.base, "dayglance", account, [
+      { entityId: KEYCHECK, envelope: original, insertOnly: true },
+    ]);
+    assert.equal(first.body.written, 1);
+    const seqAfterFirst = first.body.maxSeq;
+
+    // A racing/second device tries to write a different verifier with insertOnly.
+    const second = await postBatch(h.base, "dayglance", account, [
+      { entityId: KEYCHECK, envelope: other, insertOnly: true },
+    ]);
+    assert.equal(second.status, 200);
+    assert.equal(second.body.written, 0, "the existing verifier was skipped, not overwritten");
+    assert.equal(second.body.maxSeq, 0, "no new seq was consumed by the skipped insert-only row");
+
+    // The stored verifier is still the first writer's, unchanged.
+    const got = await getRow(h.base, "dayglance", account, KEYCHECK);
+    const row = got.body as WireRow;
+    assert.equal(row.envelope, original, "first-write-wins: the original verifier survives");
+    assert.equal(row.seq, seqAfterFirst, "the verifier's seq did not advance");
   } finally {
     h.close();
   }

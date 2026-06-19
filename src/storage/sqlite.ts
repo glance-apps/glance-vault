@@ -105,11 +105,23 @@ export class SqliteStore implements Store {
          deleted = excluded.deleted,
          server_mtime = excluded.server_mtime`,
     );
+    // For insertOnly rows we check existence first so an already-present entity
+    // is skipped without consuming a seq. The enclosing transaction is IMMEDIATE
+    // (the write lock is held), so this check-then-insert cannot race another
+    // writer.
+    const exists = this.db.prepare(
+      `SELECT 1 FROM sync_rows WHERE account_id = ? AND app = ? AND entity_id = ?`,
+    );
 
     return this.transaction(() => {
       let written = 0;
       let maxSeq = 0;
       for (const row of rows) {
+        if (row.insertOnly && exists.get(accountId, app, row.entityId)) {
+          // First-write-wins: the entity already exists, so leave it untouched
+          // and do not advance the seq. Not counted in written.
+          continue;
+        }
         const seq = this.nextSeq(accountId);
         upsert.run({
           account_id: accountId,

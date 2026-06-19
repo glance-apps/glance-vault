@@ -1,12 +1,15 @@
 // A row as accepted from a client for upsert. The server treats envelope as
 // opaque bytes. createdAt is the client clock, advisory only; the server has no
 // column for it and currently ignores it (there is nothing to parse and nothing
-// to merge on at this phase).
+// to merge on at this phase). insertOnly requests first-write-wins for this row:
+// if an entity with the same id already exists it is left untouched (no
+// overwrite, no new seq). Used for write-once rows such as the key verifier.
 export interface SyncRowInput {
   entityId: string;
   envelope: Buffer;
   deleted: boolean;
   createdAt?: number;
+  insertOnly?: boolean;
 }
 
 // A stored row as returned to a client. envelope stays opaque bytes here; the
@@ -69,7 +72,10 @@ export interface Store {
   // freshly bumped seq inside a single transaction, so seq assignment and the
   // row write commit atomically or not at all. On conflict the existing row's
   // envelope, seq, deleted, and server_mtime are replaced with the new values,
-  // so a re-upserted row advances past its previous cursor position.
+  // so a re-upserted row advances past its previous cursor position. A row marked
+  // insertOnly is the exception: if its entity already exists it is skipped
+  // entirely (not overwritten and not assigned a seq), so written counts only the
+  // rows actually inserted or overwritten.
   batchUpsert(app: string, accountId: string, rows: SyncRowInput[]): BatchResult;
 
   // Incremental fetch: rows for this app and account with seq strictly greater

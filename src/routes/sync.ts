@@ -46,8 +46,12 @@ export function syncRouter(store: Store): Router {
   });
 
   // Upsert a batch of rows. Body: { accountId, rows: [{ entityId, envelope,
-  // deleted?, createdAt? }] }. envelope is base64-encoded bytes on the wire and
-  // stored as an opaque BLOB. createdAt is advisory and currently ignored.
+  // deleted?, createdAt?, insertOnly? }] }. envelope is base64-encoded bytes on
+  // the wire and stored as an opaque BLOB. createdAt is advisory and currently
+  // ignored. insertOnly requests first-write-wins for that row (used for the key
+  // verifier). entityId is an opaque, client-chosen string: any non-empty value
+  // is accepted, including reserved ids like "__glance_keycheck"; the server
+  // never parses or format-checks it.
   router.post("/:app/batch", json({ limit: "16mb" }), (req: Request, res: Response) => {
     const app = req.params.app;
     const body = req.body as { accountId?: unknown; rows?: unknown };
@@ -68,6 +72,7 @@ export function syncRouter(store: Store): Router {
         envelope?: unknown;
         deleted?: unknown;
         createdAt?: unknown;
+        insertOnly?: unknown;
       };
       if (typeof raw.entityId !== "string" || raw.entityId.trim() === "") {
         res.status(400).json({ error: `rows[${i}].entityId is required` });
@@ -81,11 +86,16 @@ export function syncRouter(store: Store): Router {
         res.status(400).json({ error: `rows[${i}].deleted must be a boolean` });
         return;
       }
+      if (raw.insertOnly !== undefined && typeof raw.insertOnly !== "boolean") {
+        res.status(400).json({ error: `rows[${i}].insertOnly must be a boolean` });
+        return;
+      }
       rows.push({
         entityId: raw.entityId,
         envelope: Buffer.from(raw.envelope, "base64"),
         deleted: raw.deleted === true,
         createdAt: typeof raw.createdAt === "number" ? raw.createdAt : undefined,
+        insertOnly: raw.insertOnly === true,
       });
     }
 
@@ -158,7 +168,11 @@ export function syncRouter(store: Store): Router {
     });
   });
 
-  // Fetch a single row by entityId. Query: accountId. 404 if absent.
+  // Fetch a single row by entityId. Query: accountId. Returns 200 with the
+  // serialized row when it exists, or 404 when it does not (never 400 for a
+  // missing row — the key-verifier client relies on 404 meaning "new account").
+  // entityId is opaque; reserved ids like "__glance_keycheck" are fetched like
+  // any other.
   router.get("/:app/:entityId", (req: Request, res: Response) => {
     const accountId = queryAccountId(req);
     if (accountId === null) {
