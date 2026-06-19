@@ -8,6 +8,7 @@ import type {
   BatchResult,
   ListResult,
   SaltRecord,
+  PurgeResult,
 } from "./types.js";
 import { runMigrations, currentVersion } from "./migrations.js";
 
@@ -211,6 +212,25 @@ export class SqliteStore implements Store {
       // already existed. The non-null assertion documents that invariant.
       const record = stored as SaltRecord;
       return { ...record, created: info.changes > 0 };
+    });
+  }
+
+  // Remove every trace of an account in one transaction so a half-purged
+  // account can never be observed. Each DELETE is scoped by account_id; the
+  // returned count is the rows actually removed from that table (0 when the
+  // account had none). Tables are independent, so order does not matter, but the
+  // salt is deleted last to mirror "data first, then the key-derivation salt".
+  purgeAccount(accountId: string): PurgeResult {
+    return this.transaction(() => {
+      const del = (sql: string): number =>
+        (this.db.prepare(sql).run(accountId) as { changes: number }).changes;
+      return {
+        syncRows: del(`DELETE FROM sync_rows WHERE account_id = ?`),
+        intentEvents: del(`DELETE FROM intent_events WHERE account_id = ?`),
+        devices: del(`DELETE FROM devices WHERE account_id = ?`),
+        accountSeq: del(`DELETE FROM account_seq WHERE account_id = ?`),
+        salt: del(`DELETE FROM account_salts WHERE account_id = ?`),
+      };
     });
   }
 

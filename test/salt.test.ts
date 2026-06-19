@@ -151,6 +151,63 @@ test("GET returns the stored salt", async () => {
   }
 });
 
+// 4b. The salt survives PUT -> GET as the exact same 16 bytes, with the base64
+// string itself unchanged. This is the cross-device key-derivation contract: a
+// second device must derive the same root key, which it can only do if these
+// bytes match the first device's byte-for-byte. Guards against any re-encoding,
+// padding, or whitespace drift in the salt path.
+test("PUT-then-GET round-trips the salt to identical bytes", async () => {
+  const h = await startServer();
+  try {
+    const raw = randomBytes(16);
+    const salt = raw.toString("base64");
+
+    const put = await putSalt(h.base, "acct-bytes", salt);
+    assert.equal(put.body.salt, salt, "PUT echoes the exact base64 string");
+    assert.deepEqual(Buffer.from(put.body.salt, "base64"), raw, "PUT salt decodes to the same 16 bytes");
+
+    const got = await getSalt(h.base, "acct-bytes");
+    assert.equal(got.body.salt, salt, "GET returns the exact base64 string, no re-encoding");
+    assert.deepEqual(Buffer.from(got.body.salt, "base64"), raw, "GET salt decodes to the same 16 bytes");
+    assert.equal(Buffer.from(got.body.salt, "base64").length, 16, "salt is exactly 16 bytes");
+  } finally {
+    h.close();
+  }
+});
+
+// 4c. A second PUT with a different salt is ignored and returns the original
+// salt's exact bytes. If a racing device's salt were echoed back instead, the
+// two devices would derive different root keys -> guaranteed decryption failure.
+test("a second PUT with a different salt returns the original bytes", async () => {
+  const h = await startServer();
+  try {
+    const originalRaw = randomBytes(16);
+    const original = originalRaw.toString("base64");
+    const otherRaw = randomBytes(16);
+    const other = otherRaw.toString("base64");
+    assert.notEqual(original, other);
+
+    const first = await putSalt(h.base, "acct-second", original);
+    assert.equal(first.body.created, true);
+
+    const second = await putSalt(h.base, "acct-second", other);
+    assert.equal(second.body.created, false, "the second PUT stored nothing");
+    assert.equal(second.body.salt, original, "the second PUT echoes the stored salt, not its own");
+    assert.deepEqual(
+      Buffer.from(second.body.salt, "base64"),
+      originalRaw,
+      "the echoed salt is the original's exact bytes",
+    );
+    assert.notDeepEqual(
+      Buffer.from(second.body.salt, "base64"),
+      otherRaw,
+      "the second device's own salt was not stored or returned",
+    );
+  } finally {
+    h.close();
+  }
+});
+
 // 5. GET on an unknown account returns 404.
 test("GET on an unknown account is 404", async () => {
   const h = await startServer();

@@ -325,6 +325,51 @@ test("soft-delete marks the row deleted and advances its seq", async () => {
   }
 });
 
+// 5b. Envelope losslessness: the exact ciphertext bytes a client uploads via
+// batch come back byte-for-byte from list. The client stores base64(IV||GCM) and
+// the server treats it as an opaque BLOB, so any re-encoding/padding/truncation
+// here would corrupt every pulled row. Uses raw random bytes (not valid GCM) to
+// prove the path is byte-transparent, independent of any envelope structure.
+test("envelope round-trips byte-identically through batch then list", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-envelope";
+
+    // A spread of payload sizes, including ones whose length is not a multiple
+    // of 3 so base64 padding ("=") is exercised, and a zero-length envelope.
+    const raws = [
+      randomBytes(1),
+      randomBytes(2),
+      randomBytes(12 + 16), // a plausible IV(12) || 16-byte GCM tag, no plaintext
+      randomBytes(100),
+      randomBytes(257),
+      Buffer.alloc(0),
+    ];
+    const rows = raws.map((raw, i) => ({ entityId: `env${i}`, envelope: raw.toString("base64") }));
+
+    const written = await postBatch(h.base, "dayglance", account, rows);
+    assert.equal(written.status, 200);
+    assert.equal(written.body.written, rows.length);
+
+    const listed = await listRows(h.base, "dayglance", account, 0);
+    assert.equal(listed.body.rows.length, rows.length);
+    const byId = new Map(listed.body.rows.map((r) => [r.entityId, r]));
+
+    for (let i = 0; i < rows.length; i++) {
+      const returned = byId.get(`env${i}`);
+      assert.ok(returned, `row env${i} came back`);
+      assert.equal(returned.envelope, rows[i].envelope, `env${i} base64 string is unchanged`);
+      assert.deepEqual(
+        Buffer.from(returned.envelope, "base64"),
+        raws[i],
+        `env${i} decodes to the exact bytes that were uploaded`,
+      );
+    }
+  } finally {
+    h.close();
+  }
+});
+
 // 6. Cross-app isolation: rows written under one app never surface in a list for
 // another app on the same account.
 test("apps are isolated within an account", async () => {
