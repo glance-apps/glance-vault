@@ -37,17 +37,6 @@ export interface SaltRecord {
   createdAt: string;
 }
 
-// Per-table count of rows removed by a single-account purge. Every count is the
-// number of rows actually deleted, so a purge of an account with no data returns
-// all zeros.
-export interface PurgeResult {
-  syncRows: number;
-  intentEvents: number;
-  devices: number;
-  accountSeq: number;
-  salt: number;
-}
-
 // Thin storage interface. Request handlers depend only on this interface, never
 // on a concrete database. SQLite is the only implementation in Phase 0; a
 // Postgres implementation can be added later by satisfying this same contract
@@ -105,13 +94,6 @@ export interface Store {
   // and the returned value is always the stored one, not necessarily the
   // supplied one. created is true when this call stored a new salt.
   putSaltIfAbsent(accountId: string, salt: string): SaltRecord & { created: boolean };
-
-  // Purge every trace of one account: all of its sync rows (across all apps),
-  // intent events, device cursors, its monotonic seq counter, and its
-  // key-derivation salt. Destructive and irreversible; intended for clean-slate
-  // testing and maintenance. Runs in a single transaction so the account is
-  // removed atomically or not at all. Returns the per-table delete counts.
-  purgeAccount(accountId: string): PurgeResult;
 
   // Move a device's cursor forward. Upserts the (account, device) row, advancing
   // last_seen_seq to the MAX of the stored and supplied values so the cursor

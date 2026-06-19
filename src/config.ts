@@ -15,11 +15,6 @@ export interface Config {
   // Origins allowed for browser CORS requests. Empty means no cross-origin
   // requests are permitted. A single "*" entry allows any origin.
   allowedOrigins: string[];
-  // Optional separate token authorizing destructive admin/maintenance
-  // operations (e.g. purging an account). When unset or empty, the admin routes
-  // are not mounted at all, so a deployment that configures no admin token
-  // exposes no destructive endpoints.
-  adminToken?: string;
 }
 
 interface FileConfig {
@@ -27,7 +22,6 @@ interface FileConfig {
   port?: number;
   deviceToken?: string;
   allowedOrigins?: string[];
-  adminToken?: string;
 }
 
 const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
@@ -84,14 +78,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     allowedOrigins = [];
   }
 
-  // Optional admin token. Unlike the device token it is never required; absent
-  // it, server.ts leaves the admin routes unmounted. An empty/whitespace value
-  // is treated as unset.
-  const adminTokenRaw = env.GLANCEVAULT_ADMIN_TOKEN ?? file.adminToken;
-  const adminToken =
-    typeof adminTokenRaw === "string" && adminTokenRaw.trim() !== "" ? adminTokenRaw : undefined;
-
-  return { storagePath, port, deviceToken, allowedOrigins, adminToken };
+  return { storagePath, port, deviceToken, allowedOrigins };
 }
 
 function splitOrigins(value: string): string[] {

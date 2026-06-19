@@ -229,32 +229,6 @@ curl -s -X PUT http://localhost:8080/salt/house-1 \
 curl -s http://localhost:8080/salt/house-1 -H "Authorization: Bearer $TOKEN"
 ```
 
-## Admin / maintenance
-
-Destructive maintenance lives under `/admin` and is gated by a **separate** admin
-token (`GLANCEVAULT_ADMIN_TOKEN`), never the shared device token. The admin
-routes are mounted **only when an admin token is configured**; with no admin
-token set, the endpoints do not exist at all.
-
-| Method | Path | Purpose |
-|---|---|---|
-| DELETE | `/admin/account/:accountId` | Purge ALL of one account's data: every app's sync rows, intent events, device cursors, the seq counter, and the key-derivation salt |
-
-Purging is the clean-slate reset for an account: afterwards it has no salt (so the
-next device `PUT` establishes a fresh one) and no rows (so no leftover ciphertext
-encrypted under an old key can wedge a pull). It is irreversible. The response is
-`{ purged, accountId, deleted }`, where `deleted` is the per-table delete counts;
-purging an account with no data is a 200 with all-zero counts.
-
-```
-ADMIN_TOKEN=your-admin-token
-
-# Wipe account "house-1" for clean-slate testing.
-curl -s -X DELETE http://localhost:8080/admin/account/house-1 \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-# -> {"purged":true,"accountId":"house-1","deleted":{"syncRows":12,"intentEvents":0,"devices":2,"accountSeq":1,"salt":1}}
-```
-
 ## Scripts
 
 ### Phase 2 losslessness check
