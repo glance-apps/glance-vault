@@ -7,6 +7,10 @@ import type {
   SyncRowRecord,
   BatchResult,
   ListResult,
+  IntentEventInput,
+  IntentEventRecord,
+  IntentBatchResult,
+  IntentListResult,
   SaltRecord,
 } from "./types.js";
 import { runMigrations, currentVersion } from "./migrations.js";
@@ -27,6 +31,25 @@ function toRecord(row: SyncRowDb): SyncRowRecord {
     envelope: row.envelope,
     seq: row.seq,
     deleted: row.deleted !== 0,
+    serverMtime: row.server_mtime,
+  };
+}
+
+// Shape of an intent_events row as it comes back from better-sqlite3.
+interface IntentRowDb {
+  event_id: string;
+  envelope: Buffer;
+  seq: number;
+  expires_at: string;
+  server_mtime: string;
+}
+
+function toIntentRecord(row: IntentRowDb): IntentEventRecord {
+  return {
+    eventId: row.event_id,
+    envelope: row.envelope,
+    seq: row.seq,
+    expiresAt: row.expires_at,
     serverMtime: row.server_mtime,
   };
 }
@@ -192,6 +215,91 @@ export class SqliteStore implements Store {
         .run(seq, new Date().toISOString(), accountId, app, entityId);
       return { seq };
     });
+  }
+
+  // Insert-only batch of intent events. Mirrors batchUpsert's structure: each
+  // newly inserted event gets a freshly bumped seq inside one IMMEDIATE
+  // transaction, so seq and row commit together and a batch of K new events
+  // advances the account seq by exactly K. Unlike sync, a re-sent event_id is a
+  // strict no-op (insert-only, never an update) and consumes no seq: it is
+  // skipped exactly the way an already-present insertOnly sync row is. The
+  // existence check is safe under the held IMMEDIATE write lock; the ON CONFLICT
+  // DO NOTHING clause is a belt-and-suspenders guarantee of insert-only
+  // semantics. Expired rows for this account are pruned lazily in the same
+  // transaction (intents are disposable; a slightly late prune is harmless).
+  insertIntents(accountId: string, events: IntentEventInput[]): IntentBatchResult {
+    const exists = this.db.prepare(
+      `SELECT 1 FROM intent_events WHERE account_id = ? AND event_id = ?`,
+    );
+    const insert = this.db.prepare(
+      `INSERT INTO intent_events (account_id, event_id, seq, envelope, expires_at, server_mtime)
+       VALUES (@account_id, @event_id, @seq, @envelope, @expires_at, @server_mtime)
+       ON CONFLICT (account_id, event_id) DO NOTHING`,
+    );
+
+    return this.transaction(() => {
+      let written = 0;
+      let maxSeq = 0;
+      for (const ev of events) {
+        if (exists.get(accountId, ev.eventId)) {
+          // Insert-only: the event_id was already accepted, so this is a
+          // harmless re-send. Leave the stored row untouched and do not advance
+          // the seq. Not counted in written.
+          continue;
+        }
+        const seq = this.nextSeq(accountId);
+        insert.run({
+          account_id: accountId,
+          event_id: ev.eventId,
+          seq,
+          envelope: ev.envelope,
+          expires_at: ev.expiresAt,
+          server_mtime: new Date().toISOString(),
+        });
+        written += 1;
+        if (seq > maxSeq) {
+          maxSeq = seq;
+        }
+      }
+      this.pruneExpiredIntents(accountId);
+      return { written, maxSeq };
+    });
+  }
+
+  // Incremental intents fetch. Mirrors listRows (over-fetch by one to compute
+  // hasMore without a COUNT), with two differences from sync: no app scope
+  // (intents are the cross-app channel) and an expires_at > now filter so an
+  // expired-but-not-yet-pruned row never reaches a client.
+  listIntents(accountId: string, since: number, limit: number): IntentListResult {
+    const now = new Date().toISOString();
+    const dbRows = this.db
+      .prepare(
+        `SELECT event_id, envelope, seq, expires_at, server_mtime
+         FROM intent_events
+         WHERE account_id = ? AND seq > ? AND expires_at > ?
+         ORDER BY seq ASC
+         LIMIT ?`,
+      )
+      .all(accountId, since, now, limit + 1) as IntentRowDb[];
+
+    const hasMore = dbRows.length > limit;
+    const page = hasMore ? dbRows.slice(0, limit) : dbRows;
+    return { rows: page.map(toIntentRecord), hasMore };
+  }
+
+  // Hard-delete expired intent events. Scoped to one account when accountId is
+  // given (the lazy-on-write path), otherwise a global sweep. The single DELETE
+  // is atomic on its own and also composes inside an outer transaction (the
+  // insert path calls it within its IMMEDIATE transaction).
+  pruneExpiredIntents(accountId?: string): number {
+    const now = new Date().toISOString();
+    const info =
+      accountId === undefined
+        ? this.db.prepare(`DELETE FROM intent_events WHERE expires_at <= ?`).run(now)
+        : this.db
+            .prepare(`DELETE FROM intent_events WHERE account_id = ? AND expires_at <= ?`)
+            .run(accountId, now);
+    return info.changes;
   }
 
   getSalt(accountId: string): SaltRecord | null {
