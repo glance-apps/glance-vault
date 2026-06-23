@@ -556,6 +556,11 @@ Consequences that follow from the invariant:
   re-pull from seq 0 (idempotent for insert-only apply) is the way to true up
   a device suspected of missing pre-fix data.
 
+The same "a cursor advances only on what it actually consumed" principle
+applies to the intents RECEIVE cursor (section 7.6) and is the reason the
+intents codec produces no `seq` on outbound rows (7.2): a send must never be
+able to advance a receive cursor.
+
 ## 7. Intents Transport
 
 When a user enables GLANCEvault, cross-device intents move to the server
@@ -575,28 +580,173 @@ What does NOT move, because it was never a cross-device transport:
 The standalone-app guarantee is unaffected: an app talking to the database is
 still standalone with respect to the other apps.
 
-### 7.2 Why this is the easy shape
+### 7.2 Shape: codec plus app-owned delivery (NOT a sync-style transport)
 
 Intents are pure insert-only TTL events: no merge, no conflict resolution.
-They are essentially the insert-only completion rows with an expiry. The
-`@glance-apps/intents` package is already transport-abstracted, so adding a
-database transport is cheap. Two free upgrades over the file tier: cursor-
-based delivery (`seq > cursor`) instead of list-and-filter, and on the
-always-on tier, push, so cross-app nudges arrive instantly.
+But "add a database transport to the intents package" turned out to be the
+wrong mental model, and the spec previously got this wrong by calling it the
+"easy shape." `@glance-apps/intents` is a CODEC library, not a transport. It
+owns envelope encode/decode and cursor formatting; it does NOT own HTTP, the
+receive cursor, polling, or delivery. Delivery is APP-OWNED, the same boundary
+the WebDAV intents path already used. This differs from `@glance-apps/sync`,
+which IS a stateful engine that owns its transport. The two packages are
+deliberately different shapes: sync is hard and stateful so it owns the
+engine; intents are insert-only fire-and-forget so a codec plus app-owned
+delivery suffices. Do not try to unify them by hoisting a transport interface
+into the intents package; that reverses the documented app-owned boundary.
 
-### 7.3 Dual transport, per user
+So the intents work is THREE pieces, not one:
 
-This is per-user, not a codebase removal. `@glance-apps/intents` stays
-dual-transport and feature-detected, exactly like sync. File-tier users keep
-file-tier intents (and the Tasker contract is independent of either, per
-7.1). GLANCEvault is the everything-replacement for the user who opts in.
+1. Server endpoints (`glance-vault`): insert-only write to `intent_events`,
+   list-since-cursor, TTL prune. The table existed from Phase 0; the endpoints
+   were built when intents were. The server filters expired rows (`expires_at
+   > now`) so a client never sees an expired intent; expiry is server-enforced,
+   not a client chore. Prune is lazy-on-write; an idle account's expired rows
+   are harmless dead storage (invisible because list filters them) until the
+   next write triggers a sweep. A background sweep is deferred paid-tier work.
+2. Codec helpers (`glance-intents`, the `vault/` module): `buildIntentRow`
+   (raw envelope -> the `{eventId, envelope(base64), expiresAt}` row a client
+   POSTs), `parseIntentRow` (a listed row -> envelope), `parseSince`/
+   `formatSince`. Wire format is camelCase, the envelope is opaque base64 in
+   both directions, the row carries no `accountId` (scope only, never returned)
+   and does carry `serverMtime`. The codec produces NO `seq` on outbound rows
+   (seq is server-assigned), so a send is structurally incapable of advancing
+   a receive cursor.
+3. App-owned transport (each app): send, the receive cursor, the paginated
+   receive loop, transport selection, and the durable outbox (7.5). This is
+   where the cursor discipline, the encryption, and the never-lose-data
+   machinery live, because that is where the state lives.
 
-### 7.4 Salt migration
+Two upgrades over the file tier: cursor-based delivery (`seq > cursor`) instead
+of list-and-filter, and on the always-on tier, push.
 
-Intents crypto currently derives from an intents-owned root key with the root
-salt stored on the WebDAV endpoint. On the database tier that salt moves to
-ordinary server state (per section 3.4). Same HKDF-per-envelope scheme,
-different storage location for the salt.
+### 7.3 Dual transport, per user, WebDAV stays available
+
+Per-user, not a codebase removal. File-tier users keep WebDAV/iCloud intents;
+those paths (send AND receive) remain fully available and are NOT deprecated.
+People do NOT need GLANCEvault to get intents. GLANCEvault intents are an
+ADDITION alongside WebDAV, selected by an independent opt-in toggle. A user may
+run WebDAV intents, vault intents, or both. The Tasker on-device contract is
+independent of either (per 7.1).
+
+### 7.4 Always-encrypted (the zero-knowledge contract, enforced)
+
+GLANCEvault intents are ALWAYS encrypted, no exceptions, matching decision 5
+(encryption always on) for sync. This was initially built WRONG: the vault
+intents path inherited the WebDAV intents encryption MODEL, where encryption
+is gated on an optional `encryptionEnabled` flag that is off by default and
+unreachable for a vault-only user. The result was plaintext intents written to
+the zero-knowledge vault on both send (plaintext fallback when the flag was
+off) and receive (an `encrypted !== true` branch that routed plaintext). That
+violated the entire premise of the vault. The enforced design:
+
+- SEND: the vault deliverer ALWAYS builds an encrypted envelope. There is no
+  plaintext branch for the vault, ever. If the key is unavailable, the send
+  does not fall back to plaintext and does not drop; it holds (7.5).
+- RECEIVE: a non-encrypted row arriving over the vault is REJECTED (logged,
+  cursor advanced past it so it cannot wedge, never routed). A plaintext row on
+  the vault is a contract violation. The WebDAV receive path is unchanged
+  (WebDAV may legitimately carry plaintext per its own config).
+
+Key derivation: vault intents derive `deriveIntentsRootKey(syncPassphrase,
+vaultSalt)`, the SAME function the WebDAV intents path uses, but fed the vault
+salt (the server-stored `/salt/:accountId` value sync already uses) instead of
+the WebDAV-file salt. Reusing the sync salt is safe: intents and sync derive
+DIFFERENT keys from the same salt because their HKDF info strings differ
+(`glance-intents-envelope-v1` vs `glance-sync:entity:<id>`); the salt is just
+shared random bytes and sharing them couples nothing. The derived intents key
+is cached in its OWN slot, distinct from the WebDAV intents key slot, because
+the two are different keys (different salts) and must not collide.
+
+Cross-app contract: the intents derivation is app-agnostic (no app-specific
+value anywhere), so two GLANCE apps with the same passphrase and same vault
+salt derive byte-identical keys and their intents are mutually decryptable.
+This is a lock-step requirement: both apps must derive identically or
+cross-app intents become encrypted-but-undecryptable. Verified by comparing
+the derivation in each app.
+
+Key setup timing: the vault intents key is derived once, when the user enables
+vault intents (the toggle's save handler, BEFORE the app reloads, so the key
+is derived while the passphrase is in memory and then persists across the
+reload in its cache slot). "Passphrase available" is checked SEPARATELY from
+"vault connection present" (the connection can exist while the passphrase is
+null after a reload). If the passphrase is null at enable, the user is
+prompted once (reusing the sync passphrase modal); cancel leaves vault intents
+disabled with no key cached. After this one-time setup the cached key serves
+all deliveries across all reloads with no further prompt, the same way sync's
+own key and the WebDAV intents key survive reloads. The passphrase is entered
+once (at vault sync setup) and generally never again; vault intents setup is
+its own separate moment (sync may have been running for a long time before
+intents is enabled), which is exactly why the enable-time prompt exists rather
+than assuming the passphrase is present.
+
+### 7.5 Never lose an intent: the durable outbox
+
+The original intents send path (both WebDAV and vault) was fire-and-forget:
+intents were built in memory and transmitted with no local record. Any failure
+(no key, failed POST/PUT, no connection, app restart mid-send) dropped them
+silently, and the emit-site change-snapshot advanced before the async send
+resolved, so the change was forgotten with nothing to retry from. This was a
+data-loss bug independent of encryption, affecting every transport. The fix is
+a durable OUTBOX, one for all transports:
+
+- An intent is persisted to a durable store (IndexedDB) at emit time, BEFORE
+  any transmit, keyed by a stable `event_id` stamped at emit (the event_id is
+  the outbox entry id AND the server idempotency key, born at enqueue so it is
+  stable across retries).
+- Delivery is a flush over the outbox: each pending entry tracks per-transport
+  status (`pending`/`delivered`/`given-up`) and per-transport attempt counts.
+  Encryption happens at flush, inside each deliverer (the outbox stores the RAW
+  intent, never an envelope, so no plaintext envelope is ever persisted to
+  disk). A deliverer returns delivered / transient / permanent. An entry is
+  removed only when every enabled target is delivered-or-given-up.
+- Key-not-ready is a TRANSIENT result: the vault target stays pending and
+  retries when the key appears. So an intent emitted before encryption setup,
+  or before a passphrase is available, waits in the outbox rather than dropping
+  or sending plaintext.
+- Bounded give-up: a target that fails `MAX_OUTBOX_ATTEMPTS` (generous, 50;
+  much higher than the receive side because re-delivery is idempotent and
+  losing outbound data is worse than retrying) is given up loudly with the
+  event_id, so a genuinely undeliverable intent surfaces rather than retrying
+  forever.
+- Flush triggers: on enqueue, app start, the poll cadence, and right after
+  vault key setup completes (so a freshly-enabled device flushes held intents
+  once its key exists). The change-snapshot / "sent today" marker advances only
+  AFTER durable enqueue, not after send, so a failed enqueue does not consume
+  the change.
+- Server idempotency (insert-only on `eventId`) makes every retry safe; a
+  re-delivered intent is a server no-op.
+
+### 7.6 Uniform receive failure model
+
+The receive drain treats every row through one bounded-retry model, the same
+whether the failure is a decrypt failure, a missing key, or a handler throw:
+
+- Success -> advance cursor, clear the per-seq failure counter.
+- TRANSIENT (handler threw; OR the vault key is not yet available) -> do NOT
+  advance; hold and retry next poll using a persisted per-seq counter; give up
+  at `MAX_INTENT_RETRIES` (5) with a loud log + advance so a permanently-stuck
+  row cannot wedge the channel forever.
+- PERMANENT (decrypt fails with the key PRESENT, i.e. genuinely bad ciphertext;
+  OR a plaintext row over the vault; OR a malformed/unroutable row; OR a soft
+  handler failure) -> advance + log.
+
+The key distinction is decrypt-failure CAUSE: key-absent is transient (the key
+will appear, e.g. after setup; hold and retry), key-present-but-decrypt-fails
+is permanent (retrying never helps; advance). Collapsing the two either way is
+wrong: blanket-advance loses the transient case (an intent that arrived before
+setup), blanket-hold wedges on a genuinely bad row. Receive uses its OWN
+cursor and the receive failure counter; this is the inbound mirror of the
+outbox's outbound retry, and the two never share state.
+
+### 7.7 Salt migration (subsumed by 7.4)
+
+The pending "salt migration" (move the intents salt off the WebDAV file to
+server state) was completed as part of the always-encrypted fix in 7.4: vault
+intents reuse the server-stored `/salt/:accountId` value rather than a
+WebDAV-file salt. Same HKDF-per-envelope scheme, salt sourced from the vault.
+WebDAV intents (for file-tier users) keep their WebDAV-file salt; the two
+transports use their own salts and own key slots.
 
 ## 8. Media and Blob Store
 
@@ -859,12 +1009,25 @@ over-engineered to the sync cutover's standard.
   backup. Run real multi-device for a week or two.
 - Phase 5: Cut over dayGLANCE sync once lastGLANCE has proven the path. Same
   posture: retain the file payload, delete nothing.
-- Phase 6: Intents transport. Implement the database intents transport in
-  `@glance-apps/intents` (insert-only writes to `intent_events`, cursor
-  delivery), feature-detected and dual with the file tier. With both apps on
-  database sync, exercise cross-app intents end to end. Migrate the intents
-  salt to server state. (Real-time push for intents is added in Phase 9 along
-  with push for sync; until then intents deliver by polling the cursor.)
+- Phase 6: Intents transport. NOT one step: (a) server endpoints in
+  `glance-vault` (insert-only write, list-since-cursor, TTL prune over the
+  Phase-0 `intent_events` table); (b) codec helpers in `glance-intents`
+  (`buildIntentRow`/`parseIntentRow`/`parseSince`/`formatSince`), since the
+  package is a CODEC, not a transport (see section 7.2); (c) app-owned
+  transport in each app (send, receive cursor, paginated drain, transport
+  selection); (d) a durable OUTBOX in each app so no intent is ever lost
+  (section 7.5); (e) always-encrypted enforcement keyed off the sync passphrase
+  + vault salt, with plaintext rejected on receive (section 7.4); (f) the
+  uniform bounded-retry receive failure model (section 7.6). Feature-detected
+  and dual with the file tier; WebDAV intents stay available (not deprecated).
+  With both apps on database sync, cross-app intents were exercised end to end
+  (round-trip confirmed both directions). The intents salt migration was
+  subsumed into the always-encrypted fix (vault intents reuse `/salt/:accountId`).
+  Several latent bugs surfaced and were fixed during this phase: plaintext on
+  the vault (send and receive), fire-and-forget data loss on every transport, a
+  send/receive key-slot mismatch, and a transient-failure-advances-cursor loss
+  on receive. (Real-time push for intents is added in Phase 9 along with push
+  for sync; until then intents deliver by polling the cursor.)
 - Phase 7: Media blob store. Server-side blob storage (abstracted behind a
   storage interface: local disk for the container today, object storage if a
   serverless or hosted deploy is built later), presigned-style byte transfer,
