@@ -850,28 +850,144 @@ writing a real blob id MUST bump `updated_at` like any normal synced mutation.
 Do not carry the current local-only, no-timestamp-bump pattern into Phase 8;
 it is correct only for the convention-based placeholder values.
 
-### 8.3 Open implementation details (to detail at the media phase)
+### 8.3 Resolved design decisions (Phase 7)
 
-- Byte transfer pattern: bytes should flow directly between client and
-  storage via presigned-URL-style transfer rather than through application
-  logic. This sidesteps serverless function size and timeout limits and is
-  more efficient. The server mediates references and auth; bytes do not
-  transit app code.
-- Blob storage abstracts like the database: local-disk volume on the
-  self-hosted container, object storage (S3/R2/Vercel Blob) on the serverless
-  tier. Keep blob access behind an interface like the SQLite/Postgres split.
-- Blob table shape (account scope, hash, refcount or reference tracking,
-  size, created time) to be finalized at the media phase.
-- Upload path: thumbnail generation is a required step on the upload path,
-  not a deferred background nicety, because the thumbnail is content the rest
-  of the household depends on. The "add media" flow must handle generation
-  failure (corrupt image, unsupported format) by failing the upload cleanly
-  rather than publishing a reference to a thumbnail that was never made.
-- Pin / un-pin control surface: the download-to-keep option promotes a lazy-
-  streamed full-res blob to locally pinned (guarantees offline availability,
-  e.g. on a flight); the inverse un-pins and reclaims space. Pinned full-res
-  is the one thing that can grow unbounded on a device, so the un-pin control
-  matters. Exact UX to detail at the media phase.
+These settle the items that section 8.1 left at the principle level. They were
+worked out in a dedicated Phase 7 design pass and should be treated as the
+build spec, with the same status as the rest of section 8.
+
+**Content addressing and encryption (the load-bearing decision).** A blob is
+addressed by the hash of its CIPHERTEXT, and encryption is DETERMINISTIC:
+AES-GCM under the shared account vault key, with a content-derived nonce
+(nonce = a keyed hash of the plaintext, e.g. HMAC(account-key, plaintext)
+truncated to the nonce length). Identical plaintext under the same account key
+therefore produces identical ciphertext, hence the same blob id, hence dedup
+and idempotent upload. The address is a hash of opaque ciphertext, so a
+keyless server learns nothing from it (no plaintext-hash leak, no confirmation
+attack), preserving zero-knowledge.
+
+- Why not the obvious alternatives: random-IV encryption is simplest but
+  defeats dedup (identical plaintext yields different ciphertext) and makes
+  retried uploads create duplicates; convergent encryption (content-derived
+  KEY) gives dedup without a shared key but is weak precisely because the key
+  is not secret. The household ALREADY shares the vault key, so we get dedup
+  with a real secret key by deriving the NONCE (not the key) from content.
+- Nonce-reuse safety: GCM nonce reuse is catastrophic only across DIFFERENT
+  plaintexts. Here the nonce is a function of the plaintext, so two different
+  plaintexts get different nonces (collision-resistant hash) and a nonce
+  repeats only when the message is byte-identical, in which case there is
+  nothing to leak. This is safe in plain WebCrypto; no AES-GCM-SIV needed. The
+  construction must be implemented carefully and this safety argument kept with
+  the code.
+- Key derivation: blobs use the account vault root key with their OWN HKDF
+  info string (e.g. `glance-blob-v1`), domain-separated from sync
+  (`glance-sync:entity:<id>`) and intents (`glance-intents-envelope-v1`), the
+  same pattern those two already use. Same root, separate domains.
+- The addressing scheme is effectively schema: changing it later re-addresses
+  every blob. Deterministic/dedup-capable addressing is therefore built in from
+  the start even though dedup volume for a personal timeline may be modest;
+  the point is not to foreclose it and to get idempotent uploads (retry
+  safety, the media analog of the intents event_id) for free.
+
+**Whole-blob storage, NOT chunked/manifest.** A blob is one content-addressed
+unit (one video = one blob = one hash). No manifests, no chunk-level GC, no
+two-level reference graph. Chunked content-addressed storage was considered for
+large video and deliberately REJECTED as over-engineering for a self-hosted
+personal-scale product. Video is handled by transfer robustness and a size cap
+(below), not by a storage redesign. Chunked encryption remains a possible
+FUTURE optimization if, and only if, whole-file encryption of large videos is
+measured to be too slow on real devices; it is not built on spec.
+
+**Size limit (what makes whole-blob sufficient).** An operator-configurable
+maximum blob size caps the input to a size the whole-blob approach handles
+cleanly. This is the boundary below which the simple design is correct, and is
+what lets chunked storage stay deferred with confidence. Enforced TWICE: at the
+client on the PLAINTEXT size BEFORE any encrypt/upload work (UX: reject early
+with a clear message, never spend effort on a file that will be rejected), AND
+at the server on the received blob (the real guarantee, since the client check
+is only UX and a client may be modified or buggy). The limit value is operator/
+tier policy (a self-hoster sets it high; a future commercial tier uses it as a
+per-plan storage lever), the same hybrid-policy posture as GC below.
+
+**Transfer model.** Direct authenticated transfer to the server (the app server
+IS the storage on the shipping container tier; "presigned-URL-style" from the
+old 8.3 applies only to a future object-storage tier). Upload: client computes
+the hash, does a cheap existence check (HEAD or a check endpoint) and uploads
+the bytes ONLY if the server lacks that hash (so dedup saves BANDWIDTH, not
+just storage, and a retried upload of an existing hash is a no-op). Because
+video is first-class, large uploads are RESUMABLE (upload in parts the server
+reassembles into the single blob; resume from the last acked part after an
+interruption) and downloads support HTTP RANGE requests (so the platform can
+stream video and resume partial downloads). Resumable transfer of a whole blob
+is a TRANSFER-layer concern and does not change the whole-blob storage model;
+it is not chunked content-addressing. Storage stays behind an interface
+(local disk now, object storage later), unchanged endpoints across backends.
+
+**Garbage collection: reference tracking + hybrid operator policy.** The hard
+part, because a wrong reclaim loses irreplaceable media and the server cannot
+read the encrypted references inside entities.
+
+- Users never delete a BLOB directly. Users delete ENTITIES (milestones),
+  which RELEASE references. This is the only safe primitive: with dedup, a blob
+  one entity stops referencing may still be referenced by another (possibly on
+  a not-yet-synced device), so "delete the photo" can only ever mean "release
+  my reference," never "destroy the bytes."
+- Clients report reference add/release; the server maintains per-blob reference
+  counts. Zero references is NECESSARY but NOT SUFFICIENT for reclaim.
+- Reclaim requires ALL of: (1) zero references, (2) a grace period elapsed
+  since last reference activity, and (3) every non-dead device has synced
+  (acked) past the cursor point where the blob went to zero, so no
+  long-offline device can have added a reference the server has not yet seen.
+  Condition 3 uses the `devices` table (the same coordination point sync uses
+  for tombstone GC). The dangerous direction is exclusively a long-offline
+  device that ADDED a reference the server never saw; conditions 2 and 3
+  protect against it. The reverse (offline device still holds a reference the
+  server thinks released) merely fails safe (keeps the blob longer).
+- A device past an operator-configured DEAD threshold is excluded from
+  condition 3 (you cannot wait forever, which is just never-GC). This is the
+  one irreducible residual: a blob reclaimed after grace + dead-threshold,
+  where the only holder of the original was a device dead longer than the
+  threshold. The design makes it rare, bounded, opt-in, and recoverable (next).
+- Self-heal: a dangling reference (an entity pointing at a reclaimed blob)
+  surfaces as a graceful "media unavailable" placeholder, never a hard error.
+  Any device that still holds the original bytes RE-UPLOADS them on next sync;
+  because of content-addressing the re-upload lands at the SAME address and is
+  idempotent, healing the gap automatically. Data is truly lost only if the
+  blob was reclaimed AND no device anywhere still holds the original, a far
+  narrower window than "any offline device."
+- HYBRID OPERATOR POLICY (the commercial lever): what happens at zero
+  references is operator-configured. DEFAULT is RETAIN (never reclaim, zero
+  data-loss risk), correct for a self-hoster where storage is cheap and the
+  operator controls it. Reclaim-after-grace is the OPT-IN a storage-conscious
+  operator (notably the future commercial hosted tier, which pays per GB)
+  turns on knowingly. Crucially, the reference-TRACKING machinery is identical
+  either way (you must know a blob is at zero regardless); only the action at
+  zero differs. So one mechanism serves both tiers, and the safe default
+  protects anyone who does not opt in. The reclaim path's correctness bar is
+  set by the commercial tier (a premature reclaim loses a photo) even though
+  the self-host retain path ships first and is forgiving of tracking bugs (a
+  leaked orphan only wastes disk).
+
+**Blob table shape.** Account scope, blob hash (the content address), reference
+count (or the reference-tracking state condition 3 needs, including the cursor
+point a blob reached zero), size, created time, and last-reference-activity
+time (for the grace window). Finalize exact columns at build, but it must carry
+enough to evaluate the three reclaim conditions.
+
+**Thumbnails / posters as content (confirming 8.1).** A photo thumbnail and a
+video poster frame (or short preview) are each their OWN content-addressed
+blob, generated once by the uploading device, referenced by the entity
+alongside the full-res/video reference, and uploaded under the blobs-before-
+reference rule. Generation is a required, synchronous step on the upload path
+(per 8.3's prior note): a generation failure fails the upload cleanly rather
+than publishing a reference to a thumbnail that was never made. This fills the
+reserved `thumbnail_id` slot from 8.2.
+
+**Pin / un-pin (confirming 8.1).** The download-to-keep control promotes a
+lazy-streamed full-res/video blob to locally pinned for guaranteed offline
+availability; un-pin reclaims the local space. Pinned full-res is the one thing
+that can grow unbounded on a device, so the un-pin control matters. This is a
+client-local caching concern, independent of server-side GC.
 
 ## 9. Retention
 
