@@ -32,6 +32,14 @@ export interface BlobStore {
   // is atomic, so a concurrent reader never sees a half-written blob.
   put(hash: string, bytes: Buffer): void;
 
+  // Remove the stored blob's bytes. Idempotent: deleting a hash that is not
+  // present is a no-op, not an error (so a repeated reclaim sweep is safe). This
+  // is called ONLY from the reclaim sweep — the only place bytes are deleted.
+  // Because addressing is content-based and nothing else is written here, a
+  // later re-upload of the same hash (client self-heal) lands at the same
+  // address and is accepted by put() exactly as a first upload would be.
+  delete(hash: string): void;
+
   // --- Resumable upload staging (transfer-layer; opaque, not yet addressed) ---
   // Staged parts are NOT content-addressed: they are the in-flight pieces of a
   // single whole blob, reassembled and verified on finalize. This is a transfer

@@ -26,6 +26,25 @@ export interface Config {
   // check. Optional in the type so test config literals may omit it; loadConfig
   // always resolves a concrete value, and buildApp falls back to the default.
   maxBlobSize?: number;
+  // Blob reclaim (garbage collection) policy (Phase 7 final step). DEFAULT is
+  // RETAIN: reclaim is OFF, and a blob at zero references is kept forever (zero
+  // data-loss risk, correct for a self-hoster). Reclaim is a deliberate operator
+  // opt-in. When false, NOTHING is ever deleted; the reference tracking just
+  // sits there. Optional in the type so test config literals may omit it.
+  blobReclaim?: boolean;
+  // Grace window (ms) reclaim condition 2 needs: a blob is eligible only once
+  // now - last_reference_activity_at >= this, giving a slow-but-alive device
+  // time to surface a reference it added. Operator-configured; default 30 days.
+  blobGracePeriodMs?: number;
+  // Dead-device threshold (ms) reclaim condition 3 needs: a device whose last
+  // activity is older than this is treated as DEAD and excluded from the
+  // "all devices acked past the zero point" check (you cannot wait forever for a
+  // vanished device). Operator-configured; default 90 days.
+  blobDeadDevicePeriodMs?: number;
+  // How often the periodic reclaim sweep runs (ms) when reclaim is ON. Reclaim
+  // is heavier than the lazy intents prune, so it runs on a schedule rather than
+  // on a request hot path. Default 1 hour.
+  blobReclaimIntervalMs?: number;
 }
 
 interface FileConfig {
@@ -35,10 +54,22 @@ interface FileConfig {
   allowedOrigins?: string[];
   blobStorePath?: string;
   maxBlobSize?: number;
+  // Reclaim tunables are expressed in operator-friendly units in the file/env
+  // (on/off, days, minutes) and normalized to ms in loadConfig.
+  blobReclaim?: boolean;
+  blobGracePeriodDays?: number;
+  blobDeadDevicePeriodDays?: number;
+  blobReclaimIntervalMinutes?: number;
 }
 
 const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
 const DEFAULT_PORT = 8080;
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Reclaim defaults. RETAIN (off) is the safe default; the grace and dead-device
+// windows match spec section 8.3.
+export const DEFAULT_BLOB_GRACE_PERIOD_MS = 30 * DAY_MS;
+export const DEFAULT_BLOB_DEAD_DEVICE_PERIOD_MS = 90 * DAY_MS;
+export const DEFAULT_BLOB_RECLAIM_INTERVAL_MS = 60 * 60 * 1000;
 // 1 GiB. Generous for a self-hoster (video is first-class); an operator running
 // a tighter tier lowers it. This is the boundary that lets whole-blob storage
 // stay simple (no chunked content-addressing).
@@ -119,7 +150,73 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`Invalid maxBlobSize: ${maxBlobRaw}`);
   }
 
-  return { storagePath, port, deviceToken, allowedOrigins, blobStorePath, maxBlobSize };
+  // Blob reclaim policy. DEFAULT IS RETAIN (off). Reclaim turns on only when the
+  // operator explicitly opts in; an unrecognized value is treated as off.
+  const reclaimEnv = env.GLANCEVAULT_BLOB_RECLAIM;
+  let blobReclaim: boolean;
+  if (reclaimEnv !== undefined) {
+    blobReclaim = ["on", "true", "1", "yes"].includes(reclaimEnv.trim().toLowerCase());
+  } else if (typeof file.blobReclaim === "boolean") {
+    blobReclaim = file.blobReclaim;
+  } else {
+    blobReclaim = false;
+  }
+
+  const blobGracePeriodMs = resolveDuration(
+    env.GLANCEVAULT_BLOB_GRACE_PERIOD_DAYS,
+    file.blobGracePeriodDays,
+    DAY_MS,
+    DEFAULT_BLOB_GRACE_PERIOD_MS,
+    "GLANCEVAULT_BLOB_GRACE_PERIOD_DAYS",
+  );
+  const blobDeadDevicePeriodMs = resolveDuration(
+    env.GLANCEVAULT_BLOB_DEAD_DEVICE_DAYS,
+    file.blobDeadDevicePeriodDays,
+    DAY_MS,
+    DEFAULT_BLOB_DEAD_DEVICE_PERIOD_MS,
+    "GLANCEVAULT_BLOB_DEAD_DEVICE_DAYS",
+  );
+  const blobReclaimIntervalMs = resolveDuration(
+    env.GLANCEVAULT_BLOB_RECLAIM_INTERVAL_MINUTES,
+    file.blobReclaimIntervalMinutes,
+    60 * 1000,
+    DEFAULT_BLOB_RECLAIM_INTERVAL_MS,
+    "GLANCEVAULT_BLOB_RECLAIM_INTERVAL_MINUTES",
+  );
+
+  return {
+    storagePath,
+    port,
+    deviceToken,
+    allowedOrigins,
+    blobStorePath,
+    maxBlobSize,
+    blobReclaim,
+    blobGracePeriodMs,
+    blobDeadDevicePeriodMs,
+    blobReclaimIntervalMs,
+  };
+}
+
+// Resolve a duration config expressed in operator-friendly units (days,
+// minutes) to milliseconds. Env (a string) takes precedence over the file value
+// over the built-in default. The value must be a positive number.
+function resolveDuration(
+  envValue: string | undefined,
+  fileValue: number | undefined,
+  unitMs: number,
+  defaultMs: number,
+  envName: string,
+): number {
+  const raw = envValue ?? (fileValue != null ? String(fileValue) : undefined);
+  if (raw === undefined) {
+    return defaultMs;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`Invalid ${envName}: ${raw}`);
+  }
+  return Math.round(n * unitMs);
 }
 
 function splitOrigins(value: string): string[] {

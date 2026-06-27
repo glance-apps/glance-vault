@@ -278,6 +278,30 @@ export interface Store {
   // staged part BYTES are removed separately via the BlobStore.
   deleteUploadSession(uploadId: string): void;
 
+  // --- Blob reclaim / garbage collection (Phase 7 final step) ---
+
+  // Find blobs eligible for reclaim, evaluating ALL THREE conditions from spec
+  // section 8.3 as one query across every account (this is a global sweep):
+  //   (a) zero references (ref_count == 0),
+  //   (b) grace elapsed: last_reference_activity_at <= graceCutoff
+  //       (graceCutoff = now - grace_period),
+  //   (c) all NON-DEAD devices acked past the zero point: no device in the
+  //       blob's account is both non-dead (last_active > deadCutoff, where
+  //       deadCutoff = now - dead_device_period) AND behind the zero point
+  //       (last_seen_seq < zero_ref_seq).
+  // zero_ref_seq is on the same per-account seq line as devices.last_seen_seq
+  // (both from nextSeq()/account_seq), so comparison (c) is meaningful. This is
+  // a READ ONLY query: it deletes nothing. The caller (the reclaim sweep)
+  // deletes the bytes then the row for each returned blob. Cutoffs are passed in
+  // as ISO strings so all time logic lives in the sweep, not the store.
+  listReclaimableBlobs(graceCutoff: string, deadCutoff: string): BlobRecord[];
+
+  // Hard-delete a blob's metadata row. Returns true if a row was deleted, false
+  // if it was already gone (idempotent: a repeated sweep does not error or
+  // double-delete). The bytes are removed separately via the BlobStore. This and
+  // the sweep are the ONLY places a blob is ever deleted.
+  deleteBlob(accountId: string, blobHash: string): boolean;
+
   // Release underlying resources (database handle, etc.).
   close(): void;
 }

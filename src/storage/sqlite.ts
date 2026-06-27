@@ -560,6 +560,45 @@ export class SqliteStore implements Store {
     this.db.prepare(`DELETE FROM blob_upload_sessions WHERE upload_id = ?`).run(uploadId);
   }
 
+  // --- Blob reclaim (Phase 7 final step) ---
+
+  // Eligible-blob query: the three reclaim conditions as a single statement.
+  // Condition (c) is the NOT EXISTS subquery — a blob is blocked if ANY non-dead
+  // device in its account is still behind the zero point. With no devices (or no
+  // non-dead device behind the point) the subquery is empty and (c) holds. This
+  // reads only blobs and devices; it never writes.
+  listReclaimableBlobs(graceCutoff: string, deadCutoff: string): BlobRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT b.account_id, b.blob_hash, b.size, b.ref_count, b.zero_ref_seq,
+                b.created_at, b.last_reference_activity_at
+         FROM blobs b
+         WHERE b.ref_count = 0
+           AND b.zero_ref_seq IS NOT NULL
+           AND b.last_reference_activity_at <= @graceCutoff
+           AND NOT EXISTS (
+             SELECT 1 FROM devices d
+             WHERE d.account_id = b.account_id
+               AND d.last_active > @deadCutoff
+               AND d.last_seen_seq < b.zero_ref_seq
+           )`,
+      )
+      .all({ graceCutoff, deadCutoff }) as BlobRowDb[];
+    return rows.map(toBlobRecord);
+  }
+
+  // Idempotent row delete. changes is 0 when the row was already gone, so a
+  // repeated sweep neither errors nor double-counts. Reclaim leaves NO tombstone
+  // or other state behind: a future upload of the same hash inserts a fresh row
+  // (insertBlobIfAbsent) and is accepted, so a reclaimed blob can be re-uploaded
+  // and self-heal later.
+  deleteBlob(accountId: string, blobHash: string): boolean {
+    const info = this.db
+      .prepare(`DELETE FROM blobs WHERE account_id = ? AND blob_hash = ?`)
+      .run(accountId, blobHash);
+    return info.changes > 0;
+  }
+
   close(): void {
     this.db.close();
   }

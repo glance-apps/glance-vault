@@ -118,6 +118,14 @@ export class DiskBlobStore implements BlobStore {
     renameSync(tmp, path);
   }
 
+  // Idempotent byte delete (reclaim only). rmSync with force does not throw if
+  // the file is already gone, so a repeated sweep is safe. The empty shard dirs
+  // are intentionally left in place: they are cheap, bounded (~65k), and a
+  // future re-upload of any hash in the same shard reuses them.
+  delete(hash: string): void {
+    rmSync(this.blobPath(hash), { force: true });
+  }
+
   writePart(uploadId: string, partIndex: number, bytes: Buffer): void {
     if (!Number.isInteger(partIndex) || partIndex < 0) {
       throw new Error(`invalid part index: ${partIndex}`);
