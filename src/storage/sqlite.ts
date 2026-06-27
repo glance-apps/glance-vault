@@ -12,6 +12,9 @@ import type {
   IntentBatchResult,
   IntentListResult,
   SaltRecord,
+  BlobRecord,
+  UploadSessionRecord,
+  UploadPartRecord,
 } from "./types.js";
 import { runMigrations, currentVersion } from "./migrations.js";
 
@@ -51,6 +54,30 @@ function toIntentRecord(row: IntentRowDb): IntentEventRecord {
     seq: row.seq,
     expiresAt: row.expires_at,
     serverMtime: row.server_mtime,
+  };
+}
+
+// Shape of a blobs row as it comes back from better-sqlite3. zero_ref_seq is
+// nullable (NULL while the blob holds at least one reference).
+interface BlobRowDb {
+  account_id: string;
+  blob_hash: string;
+  size: number;
+  ref_count: number;
+  zero_ref_seq: number | null;
+  created_at: string;
+  last_reference_activity_at: string;
+}
+
+function toBlobRecord(row: BlobRowDb): BlobRecord {
+  return {
+    accountId: row.account_id,
+    blobHash: row.blob_hash,
+    size: row.size,
+    refCount: row.ref_count,
+    zeroRefSeq: row.zero_ref_seq,
+    createdAt: row.created_at,
+    lastReferenceActivityAt: row.last_reference_activity_at,
   };
 }
 
@@ -348,6 +375,228 @@ export class SqliteStore implements Store {
            last_active = excluded.last_active`,
       )
       .run(accountId, deviceId, lastSeenSeq, new Date().toISOString());
+  }
+
+  // --- Blob metadata + reference tracking (Phase 7) ---
+
+  getBlob(accountId: string, blobHash: string): BlobRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT account_id, blob_hash, size, ref_count, zero_ref_seq,
+                created_at, last_reference_activity_at
+         FROM blobs WHERE account_id = ? AND blob_hash = ?`,
+      )
+      .get(accountId, blobHash) as BlobRowDb | undefined;
+    return row ? toBlobRecord(row) : null;
+  }
+
+  // Idempotent insert of the metadata row for a freshly stored blob. INSERT OR
+  // IGNORE never overwrites an existing row, so a re-finalize of a known hash
+  // leaves the existing metadata (and its reference state) untouched. On first
+  // insert the blob is at zero references, and zero_ref_seq is stamped from the
+  // per-account seq source: the blob is at zero from creation, so its zero point
+  // is meaningful immediately (a blob uploaded and never referenced is still
+  // trackable toward reclaim later). Both steps run in one IMMEDIATE
+  // transaction, and the row is read back AFTER the insert attempt so the
+  // returned record is always the stored one.
+  insertBlobIfAbsent(
+    accountId: string,
+    blobHash: string,
+    size: number,
+  ): { record: BlobRecord; created: boolean } {
+    return this.transaction(() => {
+      const existing = this.getBlob(accountId, blobHash);
+      if (existing) {
+        return { record: existing, created: false };
+      }
+      const now = new Date().toISOString();
+      const zeroRefSeq = this.nextSeq(accountId);
+      this.db
+        .prepare(
+          `INSERT INTO blobs
+             (account_id, blob_hash, size, ref_count, zero_ref_seq,
+              created_at, last_reference_activity_at)
+           VALUES (?, ?, ?, 0, ?, ?, ?)`,
+        )
+        .run(accountId, blobHash, size, zeroRefSeq, now, now);
+      const record = this.getBlob(accountId, blobHash) as BlobRecord;
+      return { record, created: true };
+    });
+  }
+
+  // Reference ADD. Increment the count, clear zero_ref_seq (the blob is no
+  // longer at zero), and refresh last_reference_activity_at, all in one
+  // transaction. Returns null if the blob is not stored (blobs-before-reference:
+  // the bytes must exist before a reference to them is reported).
+  addBlobReference(accountId: string, blobHash: string): BlobRecord | null {
+    return this.transaction(() => {
+      const existing = this.getBlob(accountId, blobHash);
+      if (!existing) {
+        return null;
+      }
+      this.db
+        .prepare(
+          `UPDATE blobs
+           SET ref_count = ref_count + 1,
+               zero_ref_seq = NULL,
+               last_reference_activity_at = ?
+           WHERE account_id = ? AND blob_hash = ?`,
+        )
+        .run(new Date().toISOString(), accountId, blobHash);
+      return this.getBlob(accountId, blobHash);
+    });
+  }
+
+  // Reference RELEASE. Decrement the count (clamped at zero so a duplicate or
+  // out-of-order release can never drive it negative) and refresh
+  // last_reference_activity_at. Only a true 1 -> 0 transition stamps a fresh
+  // zero_ref_seq (the cursor point reclaim later checks device acks against); a
+  // release of an already-zero blob is a harmless no-op that leaves the existing
+  // zero point in place. NO deletion happens here: at zero the blob is merely
+  // eligible, and the default policy is RETAIN. Returns null if not stored.
+  releaseBlobReference(accountId: string, blobHash: string): BlobRecord | null {
+    return this.transaction(() => {
+      const existing = this.getBlob(accountId, blobHash);
+      if (!existing) {
+        return null;
+      }
+      const now = new Date().toISOString();
+      if (existing.refCount <= 0) {
+        // Already at zero: refresh activity but do not re-stamp the zero point.
+        this.db
+          .prepare(
+            `UPDATE blobs SET last_reference_activity_at = ?
+             WHERE account_id = ? AND blob_hash = ?`,
+          )
+          .run(now, accountId, blobHash);
+        return this.getBlob(accountId, blobHash);
+      }
+      const newCount = existing.refCount - 1;
+      // Stamp the zero point only on the 1 -> 0 transition.
+      const zeroRefSeq = newCount === 0 ? this.nextSeq(accountId) : existing.zeroRefSeq;
+      this.db
+        .prepare(
+          `UPDATE blobs
+           SET ref_count = ?, zero_ref_seq = ?, last_reference_activity_at = ?
+           WHERE account_id = ? AND blob_hash = ?`,
+        )
+        .run(newCount, zeroRefSeq, now, accountId, blobHash);
+      return this.getBlob(accountId, blobHash);
+    });
+  }
+
+  // --- Resumable upload sessions (Phase 7) ---
+
+  createUploadSession(
+    accountId: string,
+    uploadId: string,
+    blobHash: string,
+    declaredSize: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO blob_upload_sessions
+           (upload_id, account_id, blob_hash, declared_size, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(uploadId, accountId, blobHash, declaredSize, new Date().toISOString());
+  }
+
+  getUploadSession(accountId: string, uploadId: string): UploadSessionRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT upload_id, account_id, blob_hash, declared_size, created_at
+         FROM blob_upload_sessions WHERE upload_id = ? AND account_id = ?`,
+      )
+      .get(uploadId, accountId) as
+      | {
+          upload_id: string;
+          account_id: string;
+          blob_hash: string;
+          declared_size: number;
+          created_at: string;
+        }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      uploadId: row.upload_id,
+      accountId: row.account_id,
+      blobHash: row.blob_hash,
+      declaredSize: row.declared_size,
+      createdAt: row.created_at,
+    };
+  }
+
+  // Idempotent part record: a re-sent part (resume / retry) updates its size and
+  // timestamp rather than duplicating, so the acked-parts set stays accurate.
+  recordUploadPart(uploadId: string, partIndex: number, size: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO blob_upload_parts (upload_id, part_index, size, received_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (upload_id, part_index) DO UPDATE SET
+           size = excluded.size,
+           received_at = excluded.received_at`,
+      )
+      .run(uploadId, partIndex, size, new Date().toISOString());
+  }
+
+  listUploadParts(uploadId: string): UploadPartRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT part_index, size, received_at
+         FROM blob_upload_parts WHERE upload_id = ?
+         ORDER BY part_index ASC`,
+      )
+      .all(uploadId) as { part_index: number; size: number; received_at: string }[];
+    return rows.map((r) => ({ partIndex: r.part_index, size: r.size, receivedAt: r.received_at }));
+  }
+
+  // Delete the session; the parts rows cascade (FK ON DELETE CASCADE). The
+  // staged part bytes are removed separately via the BlobStore.
+  deleteUploadSession(uploadId: string): void {
+    this.db.prepare(`DELETE FROM blob_upload_sessions WHERE upload_id = ?`).run(uploadId);
+  }
+
+  // --- Blob reclaim (Phase 7 final step) ---
+
+  // Eligible-blob query: the three reclaim conditions as a single statement.
+  // Condition (c) is the NOT EXISTS subquery — a blob is blocked if ANY non-dead
+  // device in its account is still behind the zero point. With no devices (or no
+  // non-dead device behind the point) the subquery is empty and (c) holds. This
+  // reads only blobs and devices; it never writes.
+  listReclaimableBlobs(graceCutoff: string, deadCutoff: string): BlobRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT b.account_id, b.blob_hash, b.size, b.ref_count, b.zero_ref_seq,
+                b.created_at, b.last_reference_activity_at
+         FROM blobs b
+         WHERE b.ref_count = 0
+           AND b.zero_ref_seq IS NOT NULL
+           AND b.last_reference_activity_at <= @graceCutoff
+           AND NOT EXISTS (
+             SELECT 1 FROM devices d
+             WHERE d.account_id = b.account_id
+               AND d.last_active > @deadCutoff
+               AND d.last_seen_seq < b.zero_ref_seq
+           )`,
+      )
+      .all({ graceCutoff, deadCutoff }) as BlobRowDb[];
+    return rows.map(toBlobRecord);
+  }
+
+  // Idempotent row delete. changes is 0 when the row was already gone, so a
+  // repeated sweep neither errors nor double-counts. Reclaim leaves NO tombstone
+  // or other state behind: a future upload of the same hash inserts a fresh row
+  // (insertBlobIfAbsent) and is accepted, so a reclaimed blob can be re-uploaded
+  // and self-heal later.
+  deleteBlob(accountId: string, blobHash: string): boolean {
+    const info = this.db
+      .prepare(`DELETE FROM blobs WHERE account_id = ? AND blob_hash = ?`)
+      .run(accountId, blobHash);
+    return info.changes > 0;
   }
 
   close(): void {

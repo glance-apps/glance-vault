@@ -4,9 +4,10 @@ import type Database from "better-sqlite3";
 // (index) to (index + 1). The current version is tracked with SQLite's built-in
 // PRAGMA user_version, so no separate bookkeeping table is needed.
 //
-// Phase 0 creates exactly the three sync-model tables from the spec plus the
-// per-account sequence counter. No media or blob table is created in this phase:
-// its design is not finalized.
+// Phase 0 (version 1) creates the three sync-model tables plus the per-account
+// sequence counter; version 2 adds the per-account key-derivation salt; version
+// 3 adds the Phase 7 content-addressed blob store (metadata + reference
+// tracking + resumable upload sessions).
 //
 // envelope is an opaque BLOB. The server stores and returns these bytes intact
 // and never parses them.
@@ -75,6 +76,63 @@ const MIGRATIONS: Migration[] = [
         account_id TEXT NOT NULL PRIMARY KEY,
         salt       TEXT NOT NULL,   -- base64-encoded bytes, opaque to the server
         created_at TEXT NOT NULL    -- ISO timestamp
+      );
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      -- Content-addressed blob metadata (Phase 7). The bytes live in the blob
+      -- store (disk now, object storage later); this table is the queryable
+      -- per-account metadata plus the reference-tracking state. The server never
+      -- decrypts or inspects the bytes; blob_hash is the client-supplied hash of
+      -- the CIPHERTEXT (the content address), verified against the reassembled
+      -- bytes on finalize.
+      --
+      -- Reference tracking is TRACKING ONLY in this phase; reclaim/deletion is a
+      -- separate later step that builds on these columns without a schema change.
+      --   ref_count     live references reported by clients (add/release).
+      --   zero_ref_seq  the per-account seq cursor at the moment the blob most
+      --                 recently reached zero references, or NULL while it holds
+      --                 at least one reference. Same account seq space the
+      --                 devices table tracks, so reclaim condition 3 ("all
+      --                 non-dead devices acked past the zero point") can be
+      --                 evaluated later exactly like sync's tombstone GC.
+      --   last_reference_activity_at  refreshed on every add/release; the
+      --                 grace-window anchor reclaim condition 2 needs.
+      CREATE TABLE blobs (
+        account_id                 TEXT    NOT NULL,
+        blob_hash                  TEXT    NOT NULL,   -- content address (ciphertext hash)
+        size                       INTEGER NOT NULL,   -- bytes
+        ref_count                  INTEGER NOT NULL DEFAULT 0,
+        zero_ref_seq               INTEGER,            -- account seq when last at zero, NULL if >0
+        created_at                 TEXT    NOT NULL,    -- ISO timestamp
+        last_reference_activity_at TEXT    NOT NULL,    -- ISO timestamp
+        PRIMARY KEY (account_id, blob_hash)
+      );
+      CREATE INDEX idx_blobs_account ON blobs (account_id);
+
+      -- Resumable upload sessions (transfer-layer). One whole blob is uploaded
+      -- in parts the server reassembles; the session declares the content
+      -- address and total size so finalize can verify both. The staged part
+      -- BYTES live in the blob store; these rows track which parts were acked so
+      -- the resume point is a plain query.
+      CREATE TABLE blob_upload_sessions (
+        upload_id     TEXT    NOT NULL PRIMARY KEY,
+        account_id    TEXT    NOT NULL,
+        blob_hash     TEXT    NOT NULL,   -- declared content address
+        declared_size INTEGER NOT NULL,   -- declared total bytes
+        created_at    TEXT    NOT NULL    -- ISO timestamp
+      );
+      CREATE INDEX idx_blob_sessions_account ON blob_upload_sessions (account_id);
+
+      CREATE TABLE blob_upload_parts (
+        upload_id   TEXT    NOT NULL,
+        part_index  INTEGER NOT NULL,
+        size        INTEGER NOT NULL,
+        received_at TEXT    NOT NULL,
+        PRIMARY KEY (upload_id, part_index),
+        FOREIGN KEY (upload_id) REFERENCES blob_upload_sessions (upload_id) ON DELETE CASCADE
       );
     `,
   },

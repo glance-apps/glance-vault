@@ -2,5 +2,11 @@
   "storagePath": "./data/glancevault.db",
   "port": 8080,
   "deviceToken": "replace-with-a-long-random-secret",
-  "allowedOrigins": ["https://app.example.com"]
+  "allowedOrigins": ["https://app.example.com"],
+  "blobStorePath": "./data/blobs",
+  "maxBlobSize": 1073741824,
+  "blobReclaim": false,
+  "blobGracePeriodDays": 30,
+  "blobDeadDevicePeriodDays": 90,
+  "blobReclaimIntervalMinutes": 60
 }
