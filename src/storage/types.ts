@@ -78,6 +78,56 @@ export interface SaltRecord {
   createdAt: string;
 }
 
+// Blob metadata, account-scoped (Phase 7). The bytes themselves live in the
+// BlobStore (disk now, object storage later); this row is the queryable
+// metadata plus the reference-tracking state.
+//
+// blobHash is the content address: the client-supplied hash of the CIPHERTEXT.
+// The server stores it and verifies the reassembled bytes hash to it on
+// finalize, but never decrypts or inspects the bytes.
+//
+// Reference tracking (tracking only in this step; reclaim is a separate later
+// step that builds on this without a schema change):
+//   refCount    — live references reported by clients (add/release).
+//   zeroRefSeq  — the per-account seq cursor at the moment the blob most
+//                 recently reached zero references, or null while it currently
+//                 holds at least one reference. This is the coordination point
+//                 reclaim condition 3 needs ("every non-dead device has acked
+//                 past the cursor where the blob went to zero"); it lives in the
+//                 SAME account seq space the devices table tracks, exactly like
+//                 sync's tombstone GC. Stored now, consumed by reclaim later.
+//   lastReferenceActivityAt — refreshed on every add/release; the grace-window
+//                 anchor reclaim condition 2 needs.
+export interface BlobRecord {
+  accountId: string;
+  blobHash: string;
+  size: number;
+  refCount: number;
+  zeroRefSeq: number | null;
+  createdAt: string;
+  lastReferenceActivityAt: string;
+}
+
+// A resumable upload session. One whole blob is uploaded in parts that the
+// server reassembles; the session carries the declared content address and
+// total size so finalize can verify both. Transfer-layer state only.
+export interface UploadSessionRecord {
+  uploadId: string;
+  accountId: string;
+  blobHash: string;
+  declaredSize: number;
+  createdAt: string;
+}
+
+// One acked part of an in-flight upload. The bytes are staged in the BlobStore;
+// this row records that the part was received and its size, so the resume point
+// is a plain DB query and reassembly order is known.
+export interface UploadPartRecord {
+  partIndex: number;
+  size: number;
+  receivedAt: string;
+}
+
 // Thin storage interface. Request handlers depend only on this interface, never
 // on a concrete database. SQLite is the only implementation in Phase 0; a
 // Postgres implementation can be added later by satisfying this same contract
@@ -168,6 +218,65 @@ export interface Store {
   // scoped (seq is assigned per account, shared across apps), not per app. Used
   // later for coordinated tombstone GC.
   updateDeviceCursor(accountId: string, deviceId: string, lastSeenSeq: number): void;
+
+  // --- Blob metadata + reference tracking (Phase 7) ---
+
+  // Fetch a blob's metadata row, or null if the server has no record of it for
+  // this account.
+  getBlob(accountId: string, blobHash: string): BlobRecord | null;
+
+  // Insert the metadata row for a freshly stored blob, idempotently. If a row
+  // already exists for (account, blobHash) it is left untouched (content-
+  // addressing idempotency, analogous to an insert-only intent). On first
+  // insert the blob starts at zero references with zeroRefSeq stamped from the
+  // per-account seq source (it is at zero from creation until something
+  // references it). created reports whether this call inserted the row.
+  insertBlobIfAbsent(
+    accountId: string,
+    blobHash: string,
+    size: number,
+  ): { record: BlobRecord; created: boolean };
+
+  // Report a reference ADD for (account, blobHash): increment refCount, clear
+  // zeroRefSeq (the blob is no longer at zero), and refresh
+  // lastReferenceActivityAt. Returns the updated row, or null if the blob is
+  // not stored (the blobs-before-reference invariant means the blob must exist
+  // first). NO deletion happens here.
+  addBlobReference(accountId: string, blobHash: string): BlobRecord | null;
+
+  // Report a reference RELEASE for (account, blobHash): decrement refCount
+  // (clamped at zero) and refresh lastReferenceActivityAt. If this release
+  // takes the blob from one reference to zero, stamp zeroRefSeq with a fresh
+  // per-account seq (the cursor point reclaim later checks against device
+  // acks). Returns the updated row, or null if the blob is not stored. NO
+  // deletion happens here: at zero the blob is merely eligible; actual reclaim
+  // is a separate later step and the default policy is RETAIN.
+  releaseBlobReference(accountId: string, blobHash: string): BlobRecord | null;
+
+  // --- Resumable upload sessions (Phase 7, transfer-layer) ---
+
+  // Create an upload session for a whole blob being sent in parts.
+  createUploadSession(
+    accountId: string,
+    uploadId: string,
+    blobHash: string,
+    declaredSize: number,
+  ): void;
+
+  // Fetch a session by id, scoped to the account, or null if unknown.
+  getUploadSession(accountId: string, uploadId: string): UploadSessionRecord | null;
+
+  // Record that a part was received (idempotent on (uploadId, partIndex): a
+  // re-sent part updates its size and timestamp rather than duplicating).
+  recordUploadPart(uploadId: string, partIndex: number, size: number): void;
+
+  // List the acked parts of a session, ascending by index. Drives both the
+  // resume point report and the reassembly order on finalize.
+  listUploadParts(uploadId: string): UploadPartRecord[];
+
+  // Delete a session and its part records (on finalize success or abort). The
+  // staged part BYTES are removed separately via the BlobStore.
+  deleteUploadSession(uploadId: string): void;
 
   // Release underlying resources (database handle, etc.).
   close(): void;

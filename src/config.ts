@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 // Phase 0 configuration. Loaded from an optional JSON file and overlaid with
 // environment variables. There is no user model and no multi-tenant logic:
@@ -15,6 +16,16 @@ export interface Config {
   // Origins allowed for browser CORS requests. Empty means no cross-origin
   // requests are permitted. A single "*" entry allows any origin.
   allowedOrigins: string[];
+  // Directory holding the content-addressed blob store (Phase 7). Defaults to a
+  // "blobs" directory alongside the SQLite file. The bytes are opaque ciphertext
+  // the server never decrypts. Optional in the type so test config literals may
+  // omit it; loadConfig always resolves a concrete value.
+  blobStorePath?: string;
+  // Operator-configured maximum blob size in bytes (Phase 7). The server rejects
+  // an over-limit blob — the real guarantee behind the client's pre-upload
+  // check. Optional in the type so test config literals may omit it; loadConfig
+  // always resolves a concrete value, and buildApp falls back to the default.
+  maxBlobSize?: number;
 }
 
 interface FileConfig {
@@ -22,10 +33,26 @@ interface FileConfig {
   port?: number;
   deviceToken?: string;
   allowedOrigins?: string[];
+  blobStorePath?: string;
+  maxBlobSize?: number;
 }
 
 const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
 const DEFAULT_PORT = 8080;
+// 1 GiB. Generous for a self-hoster (video is first-class); an operator running
+// a tighter tier lowers it. This is the boundary that lets whole-blob storage
+// stay simple (no chunked content-addressing).
+export const DEFAULT_MAX_BLOB_SIZE = 1024 * 1024 * 1024;
+
+// Default blob directory: a "blobs" dir next to the SQLite file, so a single
+// mounted data volume holds both. ":memory:" (tests) has no directory, so fall
+// back to a relative ./data/blobs.
+export function defaultBlobStorePath(storagePath: string): string {
+  if (storagePath === ":memory:") {
+    return "./data/blobs";
+  }
+  return join(dirname(storagePath), "blobs");
+}
 
 // Read an optional JSON config file. Env vars take precedence over file values,
 // and both take precedence over the built-in defaults. The config file path
@@ -78,7 +105,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     allowedOrigins = [];
   }
 
-  return { storagePath, port, deviceToken, allowedOrigins };
+  // Blob store directory and the server-side max blob size. Env takes precedence
+  // over the config file over the built-in defaults, the same precedence as
+  // every other field.
+  const blobStorePath =
+    env.GLANCEVAULT_BLOB_STORE_PATH ?? file.blobStorePath ?? defaultBlobStorePath(storagePath);
+
+  const maxBlobRaw =
+    env.GLANCEVAULT_MAX_BLOB_SIZE ??
+    (file.maxBlobSize != null ? String(file.maxBlobSize) : undefined);
+  const maxBlobSize = maxBlobRaw != null ? Number(maxBlobRaw) : DEFAULT_MAX_BLOB_SIZE;
+  if (!Number.isInteger(maxBlobSize) || maxBlobSize <= 0) {
+    throw new Error(`Invalid maxBlobSize: ${maxBlobRaw}`);
+  }
+
+  return { storagePath, port, deviceToken, allowedOrigins, blobStorePath, maxBlobSize };
 }
 
 function splitOrigins(value: string): string[] {

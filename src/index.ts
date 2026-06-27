@@ -1,5 +1,6 @@
 import { loadConfig } from "./config.js";
 import { SqliteStore } from "./storage/sqlite.js";
+import { DiskBlobStore } from "./storage/disk-blobstore.js";
 import { buildApp } from "./server.js";
 import { SERVER_VERSION, SCHEMA_VERSION } from "./version.js";
 import { TARGET_SCHEMA_VERSION } from "./storage/migrations.js";
@@ -19,11 +20,17 @@ function main(): void {
   const store = new SqliteStore(config.storagePath);
   store.migrate();
 
-  const app = buildApp(config, store);
+  // The blob store (opaque ciphertext bytes) lives on disk now, behind the
+  // BlobStore interface so an object-storage backend can slot in later with no
+  // endpoint change.
+  const blobStore = new DiskBlobStore(config.blobStorePath!);
+
+  const app = buildApp(config, store, blobStore);
   const server = app.listen(config.port, () => {
     console.log(
       `GLANCEvault ${SERVER_VERSION} listening on port ${config.port} ` +
-        `(schema v${store.schemaVersion()}, storage ${config.storagePath})`,
+        `(schema v${store.schemaVersion()}, storage ${config.storagePath}, ` +
+        `blobs ${config.blobStorePath}, maxBlob ${config.maxBlobSize}B)`,
     );
   });
 
