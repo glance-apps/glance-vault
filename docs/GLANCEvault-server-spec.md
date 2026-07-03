@@ -186,7 +186,7 @@ interface GlanceTransport {
 }
 
 interface TransportCapabilities {
-  push: boolean;           // SSE/WebSocket. File: false; container: true (Phase 9)
+  push: boolean;           // SSE (Phase 9; WS added per-feature later, §14). File: false; container: true
   serverSequence: boolean; // server assigns ordering. File: false
   serverDedupe: boolean;   // server rejects dup entityId. File: false
   presence: boolean;
@@ -1152,19 +1152,113 @@ over-engineered to the sync cutover's standard.
 - Phase 8: Cut over lifeGLANCE, structured sync and milestone media together
   via the Phase 7 blob store (gated on media, not on the Lives feature). Same
   retain-the-file-payload posture as the other cutovers.
-- Phase 9: File-tier demotion AND real-time push. Two parts. (a) Demote the
-  file tier to the frozen tier for bring-your-own-Nextcloud and iCloud
-  self-hosters. (b) Add real-time push (SSE/WebSocket) on the always-on
-  container for both sync and intents, replacing polling as the primary
-  delivery on that tier: a change on one device pushes to others instantly,
-  and cross-app intents arrive immediately. This is layered on the proven
-  polling foundation as an enhancement, which is why it lands last rather than
-  in Phase 3. Polling remains the reconnect/catch-up backstop. (No Vercel
-  deploy guide for now; see section 3.2.)
+- Phase 9: Real-time push (SSE). Add real-time push over Server-Sent Events on
+  the always-on container for both sync and intents, replacing polling as the
+  primary delivery on that tier: a change on one device pushes to others
+  instantly, and cross-app intents arrive immediately (e.g. a lastGLANCE
+  completion lighting up dayGLANCE the moment it happens). Layered on the proven
+  polling foundation as an enhancement, which is why it lands late rather than
+  in Phase 3. Polling remains the reconnect/catch-up backstop; nothing is ever
+  delivered ONLY by push. Neither the server nor any client has any push
+  machinery today (verified: no SSE/WebSocket/EventSource in glance-vault), so
+  this is a both-ends build: server-side emission plus client-side consumption.
+  See section 14 for the SSE design and the SSE-vs-WebSocket decision.
+- Phase 10: File-tier demotion and the GLANCEvault "graduation." Demote the
+  file tier (WebDAV/iCloud) to the frozen bring-your-own-Nextcloud/iCloud tier,
+  and use this phase to take GLANCEvault out of beta: clean up the settings
+  modals/screens across the apps, finalize the Pro tier surfaces, and do the
+  positioning work for the paid GLANCEvault Pro (Paddle, Hetzner, the pricing
+  already settled in section 13). This is a status/positioning-plus-cleanup
+  milestone more than a transport build, which is why it follows the push work
+  rather than bundling with it.
 
 Reversibility discipline: never delete a file-tier payload until its app has
 run clean on the server for real. Any surprise is then a one-line revert to
 the old transport.
+
+## 14. Real-time push design (Phase 9)
+
+### 14.1 Transport decision: SSE now, WebSocket added per-feature later
+
+Phase 9 uses Server-Sent Events (SSE), not WebSocket. The reasoning, recorded so
+a future reader does not mistake this for a fork that excluded WebSocket:
+
+The push job here is one-directional: the server tells a client "your account
+has new activity, go sync." The client's reply is a NORMAL authenticated HTTP
+sync/intent-drain request, the same one it already makes on the poll cadence.
+So push only replaces the poll TIMER with an instant NUDGE; it never needs the
+client to stream back over the persistent connection, because every
+client-to-server need is already an ordinary HTTP request. That is exactly SSE's
+model (server to client over plain HTTP, auto-reconnect, rides the existing
+auth/CORS/proxy path), and SSE is dramatically simpler to build, debug, and
+operate than WebSocket. Hetzner/Caddy support SSE with `flush_interval -1`.
+
+Crucially, choosing SSE does NOT foreclose WebSocket. SSE and WebSocket can run
+side by side on the same Node server. Push-for-sync stays on SSE (where a
+one-directional notification belongs, forever); if a genuinely bidirectional
+real-time feature is ever built, it gets a WebSocket endpoint added surgically
+for that feature, without disturbing the SSE sync-push. The architecture is
+therefore "SSE for notifications; WebSocket added per-feature for true
+bidirectional real-time," and Phase 9's SSE choice is the correct right-sized
+tool for sync-push regardless of what collaboration features come later.
+
+### 14.2 Future use cases and when WebSocket would be added
+
+Every collaboration feature currently envisioned for the suite is
+server-to-client notification plus HTTP writes, i.e. SSE-solvable: shared Lives
+and family timelines in lifeGLANCE, shared household state in lastGLANCE,
+aggregated team-progress sharing in goalGLANCE, share-token collaboration across
+the suite, and lifeGLANCE Studio hosted-export "your export is ready"
+notifications. All of these are "someone writes via HTTP, others are nudged to
+sync" — SSE.
+
+WebSocket becomes the right tool only for TRUE bidirectional real-time, which in
+this suite would most naturally appear as:
+- Live presence ("who is active / here / doing this right now") — most natural
+  in lastGLANCE (household: who is doing which chore now) and goalGLANCE (team:
+  who is active during a check-in). Presence is continuous bidirectional status,
+  which SSE-plus-HTTP-heartbeat only approximates awkwardly. This is the single
+  most WebSocket-native pattern in the suite.
+- Live co-editing with cursors/positions — simultaneous editing of a shared
+  artifact seeing each other live (Figma/Docs style): possible if dayGLANCE
+  shared calendars, lifeGLANCE Studio collaborative memorial/wedding projects,
+  or goalGLANCE team boards ever grow into live co-editing rather than
+  async state-sharing.
+- Live team sessions in goalGLANCE — everyone in a shared live view during a
+  standup, with real-time presence and reactions.
+- Sub-second claim/lock races (e.g. lastGLANCE "I've got the trash" claimed
+  instantly so two people don't collide) — borderline; SSE-solvable but a case
+  where WebSocket's bidirectionality is cleaner.
+
+None of these are near-term (Phase 9 is sync-push only; collaboration is later).
+When any of them is scoped, WebSocket is the expected tool and is ADDED alongside
+the SSE push, not in place of it. So SSE now is not a limitation.
+
+### 14.3 Push design (nudge-only, polling-backstopped)
+
+- NUDGE-ONLY: push carries only a signal ("account X has new activity" / a new
+  seq is available), NOT the encrypted payloads. The client responds by running
+  its existing authenticated sync/intent-drain. This keeps push dumb, reuses the
+  proven sync/drain machinery unchanged, and keeps the zero-knowledge story
+  clean (push carries no plaintext, just "go look").
+- POLLING IS THE BACKSTOP, ALWAYS: push is an optimization, not a delivery
+  guarantee. A device that is connected drains on nudge; a disconnected device
+  (backgrounded, mobile, network drop) falls back to polling and catches up on
+  reconnect. Nothing is delivered only by push, so if push breaks, delivery
+  degrades to today's working polling — the correctness backstop is untouched.
+- SERVER-SIDE: an in-process pub/sub keyed by account_id maps to that account's
+  connected SSE connections; a write (new seq, or a landed intent) emits a nudge
+  to the account's connections. Single-container in-memory pub/sub is simple;
+  push at multi-tenant scale (many persistent connections, horizontal scaling of
+  stateful connections) is the hard part and defers with the paid product
+  (section 13), not Phase 9.
+- SCOPE: vault tier only (the file tier stays polling/frozen), suite-wide across
+  all three apps, covering BOTH sync and intents.
+- BUILD SEQUENCE: server-side SSE emission first (hold connections, emit nudges
+  on writes, proven in isolation), then one app consumes it end to end
+  (nudge to sync/drain), then roll to the other two — the same server-first,
+  one-app-slice, then-propagate discipline used for the blob store and the
+  cutovers.
 
 ## 13. Deferred / Out of Scope (recorded so it is not lost)
 
