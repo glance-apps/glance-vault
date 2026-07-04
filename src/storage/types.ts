@@ -152,6 +152,12 @@ export interface Store {
   // row it stamps.
   nextSeq(accountId: string): number;
 
+  // Read the account's current latest seq WITHOUT advancing it, or 0 if the
+  // account has never had a seq assigned. A pure read: unlike nextSeq it never
+  // bumps the counter. Used by the SSE push endpoint to send a connecting client
+  // the account's current position (the initial reconcile signal).
+  latestSeq(accountId: string): number;
+
   // Run fn inside a single write transaction. If fn throws, the transaction is
   // rolled back. Returns whatever fn returns.
   transaction<T>(fn: () => T): T;

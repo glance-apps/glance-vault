@@ -1,5 +1,6 @@
 import { Router, json, type Request, type Response } from "express";
 import type { Store, SyncRowInput, SyncRowRecord } from "../storage/types.js";
+import type { Emit } from "../realtime/hub.js";
 
 // The three apps that share this server. The app path param is validated against
 // this set; anything else is rejected with 400.
@@ -33,7 +34,14 @@ function queryAccountId(req: Request): string | null {
 // (mounted after the auth middleware in server.ts). No crypto, no envelope
 // parsing, no intents, no media: just opaque rows in and out with server
 // assigned seq ordering.
-export function syncRouter(store: Store): Router {
+// emit is the best-effort real-time push hook (Phase 9). After a write that
+// advances the account seq commits, we call emit(accountId, { seq }) so any
+// connected SSE client for that account is nudged to drain. emit is guaranteed
+// non-throwing and non-blocking (it fans out to in-memory connections and drops
+// dead ones); it is called AFTER the store write returns (durably committed) so
+// a nudged client that drains immediately sees the new rows. Push is an
+// optimization only: it never gates or fails the write.
+export function syncRouter(store: Store, emit: Emit): Router {
   const router = Router();
 
   // Validate the app path param once for every route that carries it.
@@ -100,6 +108,12 @@ export function syncRouter(store: Store): Router {
     }
 
     const result = store.batchUpsert(app, body.accountId, rows);
+    // Nudge connected clients only when the write actually advanced the seq
+    // (maxSeq is 0 when every row was an insert-only no-op). Post-commit,
+    // best-effort: emit never throws and never blocks the response.
+    if (result.maxSeq > 0) {
+      emit(body.accountId, { seq: result.maxSeq });
+    }
     res.status(200).json(result);
   });
 
@@ -199,6 +213,9 @@ export function syncRouter(store: Store): Router {
       res.status(404).json({ error: "not found" });
       return;
     }
+    // A soft-delete advances the account seq (a new tombstone seq), so nudge
+    // connected clients to drain. Post-commit, best-effort.
+    emit(accountId, { seq: result.seq });
     res.status(200).json(result);
   });
 

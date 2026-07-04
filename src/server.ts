@@ -10,6 +10,8 @@ import { syncRouter } from "./routes/sync.js";
 import { intentsRouter } from "./routes/intents.js";
 import { saltRouter } from "./routes/salt.js";
 import { blobsRouter } from "./routes/blobs.js";
+import { eventsRouter } from "./routes/events.js";
+import { InProcessAccountHub, type AccountHub, type Emit } from "./realtime/hub.js";
 
 // Build the Express app. Kept separate from the listen() call in index.ts so it
 // can be constructed in tests without binding a port.
@@ -23,7 +25,17 @@ import { blobsRouter } from "./routes/blobs.js";
 // constructed from the config so existing call sites (which never exercise the
 // blob endpoints) keep working unchanged; the DiskBlobStore touches no disk
 // until a blob is actually written.
-export function buildApp(config: Config, store: Store, blobStore?: BlobStore): Express {
+// hub is the in-process real-time push registry (Phase 9). Optional so tests can
+// inject their own instance to observe connections; when omitted a fresh
+// InProcessAccountHub is created. It is per-app (per process): one hub holds all
+// of this container's live SSE connections. Multi-container fan-out is deferred
+// (spec §13, §14.3) and would slot in behind the AccountHub interface here.
+export function buildApp(
+  config: Config,
+  store: Store,
+  blobStore?: BlobStore,
+  hub: AccountHub = new InProcessAccountHub(),
+): Express {
   const app = express();
 
   app.use(cors(config.allowedOrigins));
@@ -32,16 +44,26 @@ export function buildApp(config: Config, store: Store, blobStore?: BlobStore): E
 
   app.use(deviceTokenAuth(config.deviceToken));
 
+  // The best-effort emission hook wired to the hub. Passed to the write routers
+  // so they nudge connected clients after a commit. hub.publish is non-throwing
+  // and non-blocking by contract, so a push failure can never affect a write.
+  const emit: Emit = (accountId, nudge) => hub.publish(accountId, nudge);
+
   // Protected routes. Phase 1 adds the sync transport; the salt store is a
   // Phase 3 prerequisite; intents are the cross-app transport; Phase 7 adds the
-  // content-addressed blob store.
-  app.use("/sync", syncRouter(store));
-  app.use("/intents", intentsRouter(store));
+  // content-addressed blob store; Phase 9 adds the SSE real-time push endpoint.
+  app.use("/sync", syncRouter(store, emit));
+  app.use("/intents", intentsRouter(store, emit));
   app.use("/salt", saltRouter(store));
 
   const blobs = blobStore ?? new DiskBlobStore(config.blobStorePath ?? defaultBlobStorePath(config.storagePath));
   const maxBlobSize = config.maxBlobSize ?? DEFAULT_MAX_BLOB_SIZE;
   app.use("/blobs", blobsRouter(store, blobs, maxBlobSize));
+
+  // Real-time push (nudge-only SSE), authenticated and account-scoped exactly
+  // like the routes above. See routes/events.ts for the event shape and the
+  // reverse-proxy flush requirement.
+  app.use("/events", eventsRouter(store, hub));
 
   return app;
 }
