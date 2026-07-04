@@ -104,13 +104,35 @@ async function postBatch(
   app: string,
   accountId: string,
   rows: Array<{ entityId: string; envelope: string; deleted?: boolean; insertOnly?: boolean }>,
+  notify?: boolean,
 ): Promise<{ status: number; body: { written: number; maxSeq: number } }> {
+  const payload: Record<string, unknown> = { accountId, rows };
+  if (notify !== undefined) {
+    payload.notify = notify;
+  }
   const res = await fetch(`${base}/sync/${app}/batch`, {
     method: "POST",
     headers: authHeaders(),
-    body: JSON.stringify({ accountId, rows }),
+    body: JSON.stringify(payload),
   });
   return { status: res.status, body: (await res.json()) as { written: number; maxSeq: number } };
+}
+
+// The per-cycle device-state / cursor / high-water-mark report: the bookkeeping
+// write a client makes every sync cycle even when no content changed.
+async function postDevice(
+  base: string,
+  app: string,
+  accountId: string,
+  deviceId: string,
+  lastSeenSeq: number,
+): Promise<{ status: number; body: { updated: boolean } }> {
+  const res = await fetch(`${base}/sync/${app}/device`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ accountId, deviceId, lastSeenSeq }),
+  });
+  return { status: res.status, body: (await res.json()) as { updated: boolean } };
 }
 
 async function deleteRow(
@@ -593,6 +615,139 @@ test("the connection receives periodic heartbeat comments", async () => {
     const second = await c.nextComment(1000);
     assert.equal(second.comment, "heartbeat");
     c.close();
+  } finally {
+    h.close();
+  }
+});
+
+// ======================================================================
+// Self-nudge loop fix: only CONTENT writes nudge; bookkeeping writes do
+// not. (Account isolation and best-effort emission are unchanged and stay
+// covered by the tests above.)
+// ======================================================================
+
+test("a device-cursor (bookkeeping) write emits no nudge and does not advance the seq", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-cursor-silent";
+    const c = await SseClient.connect(h.base, account);
+    await c.nextEvent("ready");
+
+    // The per-cycle device-state / last-seen / HWM report. It must not nudge.
+    const rep = await postDevice(h.base, "dayglance", account, "phone", 5);
+    assert.equal(rep.status, 200);
+    assert.deepEqual(rep.body, { updated: true });
+
+    // It also does not touch the account seq (bookkeeping never calls nextSeq).
+    assert.equal(h.store.latestSeq(account), 0, "the cursor report did not advance the seq");
+    // And no activity nudge is delivered within the window.
+    await assert.rejects(c.nextEvent("activity", 300), /timed out/, "a cursor report fires no nudge");
+    c.close();
+  } finally {
+    h.close();
+  }
+});
+
+test("a content-free sync cycle produces no nudge (no self-loop)", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-noloop";
+    const c = await SseClient.connect(h.base, account);
+    await c.nextEvent("ready");
+
+    // Simulate several housekeeping-only cycles: each cycle the client only
+    // re-reports its cursor (no content changed). None of these may nudge, or the
+    // nudge would trigger the next cycle -> the self-nudge loop this fix removes.
+    for (let i = 1; i <= 3; i++) {
+      await postDevice(h.base, "dayglance", account, "phone", i);
+    }
+    await assert.rejects(
+      c.nextEvent("activity", 400),
+      /timed out/,
+      "a content-free cycle never nudges",
+    );
+    c.close();
+  } finally {
+    h.close();
+  }
+});
+
+test("a bookkeeping batch write (notify:false) commits and advances seq but fires no nudge", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-notify-false";
+    const c = await SseClient.connect(h.base, account);
+    await c.nextEvent("ready");
+
+    // A device-state row persisted through the content batch endpoint, marked as
+    // bookkeeping with notify:false. The WRITE must still happen (row stored, seq
+    // advanced) — only the nudge is suppressed.
+    const write = await postBatch(
+      h.base,
+      "dayglance",
+      account,
+      [{ entityId: "__device_state__", envelope: garbageEnvelope() }],
+      false,
+    );
+    assert.equal(write.status, 200);
+    assert.equal(write.body.written, 1, "the bookkeeping row was still written");
+    assert.equal(write.body.maxSeq, 1, "and it still advanced the account seq");
+    assert.equal(h.store.latestSeq(account), 1, "the seq really advanced (write not gated)");
+
+    // No nudge for the suppressed write...
+    await assert.rejects(
+      c.nextEvent("activity", 300),
+      /timed out/,
+      "notify:false suppresses the nudge",
+    );
+
+    // ...but suppression is per-write, not sticky: the very next real content
+    // write (notify omitted) nudges instantly with the new latest seq.
+    const real = await postBatch(h.base, "dayglance", account, [
+      { entityId: "task-1", envelope: garbageEnvelope() },
+    ]);
+    assert.equal(real.body.maxSeq, 2);
+    const nudge = await c.nextEvent("activity");
+    assert.deepEqual(JSON.parse(nudge.data!), { seq: 2 }, "the following content write still nudges");
+    c.close();
+  } finally {
+    h.close();
+  }
+});
+
+test("a normal content batch (notify omitted) still nudges instantly", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-content-nudges";
+    const c = await SseClient.connect(h.base, account);
+    await c.nextEvent("ready");
+
+    // No notify flag at all -> default ON -> nudge. This is the preserve-real-
+    // nudges property: existing clients that never send the flag are unaffected.
+    const write = await postBatch(h.base, "dayglance", account, [
+      { entityId: "task-a", envelope: garbageEnvelope() },
+      { entityId: "task-b", envelope: garbageEnvelope() },
+    ]);
+    assert.equal(write.body.maxSeq, 2);
+    const nudge = await c.nextEvent("activity");
+    assert.deepEqual(JSON.parse(nudge.data!), { seq: 2 });
+    c.close();
+  } finally {
+    h.close();
+  }
+});
+
+test("notify must be a boolean when present", async () => {
+  const h = await startServer();
+  try {
+    const res = await fetch(`${h.base}/sync/dayglance/batch`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ accountId: "acct-x", rows: [], notify: "false" }),
+    });
+    assert.equal(res.status, 400, "a non-boolean notify is rejected");
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /notify must be a boolean/);
   } finally {
     h.close();
   }

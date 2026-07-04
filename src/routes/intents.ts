@@ -109,8 +109,11 @@ export function intentsRouter(store: Store, emit: Emit): Router {
     }
 
     const result = store.insertIntents(body.accountId, events);
-    // Nudge connected clients only when a new intent actually landed (maxSeq is
-    // 0 when every event was an insert-only re-send). Post-commit, best-effort.
+    // A landed intent is always CONTENT — an insert-only cross-device message
+    // another device must pull — never bookkeeping, so it nudges unconditionally
+    // (there is no notify opt-out here, unlike the sync batch path). Emit only
+    // when a new intent actually landed (maxSeq is 0 when every event was an
+    // insert-only re-send). Post-commit, best-effort.
     if (result.maxSeq > 0) {
       emit(body.accountId, { seq: result.maxSeq });
     }
