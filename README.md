@@ -176,7 +176,16 @@ on the wire and stored as a BLOB the server never parses.
 The device cursor (`POST /sync/:app/device`, body `{ accountId, deviceId,
 lastSeenSeq }`) records how far a device has synced, advancing `last_seen_seq`
 forward only. It is account scoped, not per app, and feeds coordinated tombstone
-GC in a later phase. Returns `{ updated: true }`.
+GC in a later phase. Returns `{ updated: true }`. This is a bookkeeping write: it
+does not advance the account `seq` and never fires a real-time push nudge.
+
+The batch body accepts an optional `notify` boolean (default `true`). When a
+client persists per-cycle bookkeeping state (device-state / high-water-mark) as a
+sync row rather than as content, it should send `notify: false` so the write
+still commits and advances `seq` but does **not** fire a push nudge. This is what
+keeps SSE push from turning a routine housekeeping write into a self-nudge loop
+(nudge → drain → housekeep → nudge). Real content writes omit the flag and nudge
+instantly. See [Real-time push](#real-time-push-sse).
 
 `seq` is a server-assigned monotonic cursor per account. Clients page forward by
 passing the highest `seq` they have seen as `since`. `list` accepts `limit`
@@ -262,12 +271,19 @@ Events on the wire:
 - `event: ready` — sent once on connect. `data: {"seq": N}` where `N` is the
   account's current latest seq. A just-connected client compares this to its
   cursor and drains immediately, without waiting for the next write.
-- `event: activity` — sent whenever a write advances the account seq: a sync
-  batch upsert, a sync soft-delete, or a landed intent. `data: {"seq": N}` with
-  the account's latest seq. Sync and intents share one per-account seq, so this
-  single nudge covers both; the client drains sync and intents together.
+- `event: activity` — sent on a **content** write: a sync batch upsert, a sync
+  soft-delete, or a landed intent. `data: {"seq": N}` with the account's latest
+  seq. Sync and intents share one per-account seq, so this single nudge covers
+  both; the client drains sync and intents together.
 - `: heartbeat` — an SSE comment line sent every ~20s to keep the connection
   alive through idle proxy/load-balancer timeouts. Clients ignore it.
+
+Only content writes nudge. Bookkeeping writes never do: the device-cursor
+endpoint (`POST /sync/:app/device`) does not advance `seq` and never nudges, and
+a batch write sent with `notify: false` (used for device-state / high-water-mark
+rows) commits without nudging. This prevents a per-cycle housekeeping write from
+provoking a nudge → drain → housekeep → nudge self-loop, while genuine content
+changes still nudge instantly.
 
 Emission is best-effort and post-commit: a nudge fires only after the write is
 durably committed, and a slow or dead connection is dropped, never allowed to

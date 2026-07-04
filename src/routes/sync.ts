@@ -62,7 +62,7 @@ export function syncRouter(store: Store, emit: Emit): Router {
   // never parses or format-checks it.
   router.post("/:app/batch", json({ limit: "16mb" }), (req: Request, res: Response) => {
     const app = req.params.app;
-    const body = req.body as { accountId?: unknown; rows?: unknown };
+    const body = req.body as { accountId?: unknown; rows?: unknown; notify?: unknown };
 
     if (typeof body.accountId !== "string" || body.accountId.trim() === "") {
       res.status(400).json({ error: "accountId is required" });
@@ -72,6 +72,14 @@ export function syncRouter(store: Store, emit: Emit): Router {
       res.status(400).json({ error: "rows must be an array" });
       return;
     }
+    if (body.notify !== undefined && typeof body.notify !== "boolean") {
+      res.status(400).json({ error: "notify must be a boolean" });
+      return;
+    }
+    // Default ON: a write nudges unless it explicitly opts out. This preserves
+    // every real content nudge (a client that never sends the flag behaves
+    // exactly as before) while letting a bookkeeping write silence itself.
+    const notify = body.notify !== false;
 
     const rows: SyncRowInput[] = [];
     for (let i = 0; i < body.rows.length; i++) {
@@ -108,10 +116,19 @@ export function syncRouter(store: Store, emit: Emit): Router {
     }
 
     const result = store.batchUpsert(app, body.accountId, rows);
-    // Nudge connected clients only when the write actually advanced the seq
-    // (maxSeq is 0 when every row was an insert-only no-op). Post-commit,
-    // best-effort: emit never throws and never blocks the response.
-    if (result.maxSeq > 0) {
+    // Real-time nudge (Phase 9), emitted ONLY for content writes. Two gates:
+    //   - notify: a client marks a per-cycle BOOKKEEPING write (device-state /
+    //     cursor / high-water-mark persisted as a sync row) with `notify: false`.
+    //     Such a write still commits and still advances the seq — it just does
+    //     not wake every other device. This is what breaks the SSE self-nudge
+    //     loop: a content-free housekeeping cycle no longer nudges, so it cannot
+    //     provoke a nudge -> drain -> housekeep -> nudge cascade. A genuine
+    //     content write (notify omitted or true) still nudges instantly.
+    //   - maxSeq > 0: nothing was actually written (every row was an insert-only
+    //     no-op), so there is nothing to drain.
+    // The WRITE is never gated — only the nudge is. Post-commit, best-effort:
+    // emit never throws and never blocks the response.
+    if (notify && result.maxSeq > 0) {
       emit(body.accountId, { seq: result.maxSeq });
     }
     res.status(200).json(result);
@@ -122,6 +139,14 @@ export function syncRouter(store: Store, emit: Emit): Router {
   // device cursor is account scoped, not per app (seq is assigned per account);
   // the :app segment is kept only for route consistency with the other sync
   // endpoints. Used later for coordinated tombstone GC.
+  //
+  // BOOKKEEPING PATH — NEVER emits a real-time nudge. This is the per-cycle
+  // device-state / last-seen / high-water-mark write every device makes even
+  // when no content changed. It does not advance the account seq
+  // (updateDeviceCursor never calls nextSeq) and it must never publish a nudge:
+  // nudging here would wake every connected device, each of which drains and
+  // re-reports its cursor, which would nudge again — the SSE self-nudge loop.
+  // There is deliberately no emit() call in this handler; keep it that way.
   router.post("/:app/device", json({ limit: "16kb" }), (req: Request, res: Response) => {
     const body = req.body as { accountId?: unknown; deviceId?: unknown; lastSeenSeq?: unknown };
     if (typeof body.accountId !== "string" || body.accountId.trim() === "") {
