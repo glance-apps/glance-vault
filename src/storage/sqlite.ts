@@ -124,6 +124,16 @@ export class SqliteStore implements Store {
     return row.value;
   }
 
+  // Current latest seq for an account, read-only (never advances the counter).
+  // Returns 0 when the account has no account_seq row yet — i.e. nothing has
+  // ever been written for it, so its position is the pre-first-write baseline.
+  latestSeq(accountId: string): number {
+    const row = this.db
+      .prepare(`SELECT value FROM account_seq WHERE account_id = ?`)
+      .get(accountId) as { value: number } | undefined;
+    return row ? row.value : 0;
+  }
+
   // Use an IMMEDIATE transaction so the write lock is taken up front. This
   // avoids a deferred-to-write lock upgrade deadlocking against another writer.
   transaction<T>(fn: () => T): T {

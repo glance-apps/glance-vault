@@ -1,0 +1,144 @@
+import { Router, type Request, type Response } from "express";
+import type { Store } from "../storage/types.js";
+import type { AccountHub, Nudge, Subscriber } from "../realtime/hub.js";
+
+// Real-time push endpoint (Phase 9, spec §14). A single authenticated,
+// account-scoped SSE stream. It is mounted after the device-token auth
+// middleware (server.ts), so every connection is behind the same Bearer auth as
+// the sync/intents routes, and it is scoped to the account named in the
+// accountId query param exactly like `/sync/:app/list` and `/intents/list`. A
+// token for account A subscribes only to account A's nudges; the hub is keyed by
+// that accountId, so A never receives B's nudges.
+//
+// NUDGE-ONLY: the stream carries only a signal (the account's latest seq), never
+// payloads/plaintext/row content. The client compares the seq to its cursor and,
+// if behind, runs its existing authenticated sync + intent drain. Polling stays
+// the backstop; this is purely an optimization (spec §14.3).
+//
+// Event shape on the wire (SSE `event:`/`data:` frames):
+//   event: ready     — sent once, immediately on connect.
+//                      data: {"seq": <account's current latest seq>}
+//                      Lets a just-connected client reconcile without waiting
+//                      for the next write.
+//   event: activity  — sent on every write that advances the account seq: the
+//                      sync batch-upsert path, the sync soft-delete path, and
+//                      the intents insert path. Sync and intents share ONE
+//                      per-account seq source, so a single "activity" nudge
+//                      covers both; the client drains sync and intents together.
+//                      data: {"seq": <account's latest seq after the write>}
+//   : heartbeat      — an SSE comment line (ignored by EventSource) sent
+//                      periodically to keep the connection alive through idle
+//                      proxy/load-balancer timeouts.
+//
+// REVERSE-PROXY FLUSH REQUIREMENT: this response must NOT be buffered. Nudges are
+// written incrementally and must reach the client immediately, so a reverse
+// proxy in front of the server has to disable response buffering for this route
+// — Caddy: `reverse_proxy` with `flush_interval -1`; nginx: `proxy_buffering
+// off` (also signalled via the `X-Accel-Buffering: no` response header below).
+// Without it, nudges are batched and the real-time property is lost.
+
+const DEFAULT_HEARTBEAT_MS = 20_000;
+
+// Pull accountId from the query string, requiring a non-empty string. Same
+// helper shape as the sync and intents routers.
+function queryAccountId(req: Request): string | null {
+  const value = req.query.accountId;
+  if (typeof value !== "string" || value.trim() === "") {
+    return null;
+  }
+  return value;
+}
+
+// Format one SSE frame: a named event with a single JSON data line, terminated
+// by the blank line the SSE wire format requires.
+function frame(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+export interface EventsOptions {
+  // Heartbeat interval in ms. Kept configurable so tests can observe a heartbeat
+  // quickly; defaults to a proxy-friendly ~20s in production.
+  heartbeatMs?: number;
+}
+
+export function eventsRouter(store: Store, hub: AccountHub, opts: EventsOptions = {}): Router {
+  const router = Router();
+  const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  let nextId = 1;
+
+  router.get("/", (req: Request, res: Response) => {
+    const accountId = queryAccountId(req);
+    if (accountId === null) {
+      res.status(400).json({ error: "accountId is required" });
+      return;
+    }
+
+    const sub: Subscriber = {
+      id: nextId++,
+      deliver(nudge: Nudge) {
+        // A dead/closed socket makes this throw (or the response is already
+        // ended); let it propagate so the hub evicts this subscriber. Write
+        // backpressure (write() returning false) is not death and is ignored.
+        if (res.writableEnded) {
+          throw new Error("SSE response already ended");
+        }
+        res.write(frame("activity", nudge));
+      },
+    };
+
+    // Enforce the per-account connection cap BEFORE any header is written, so an
+    // over-cap client gets a clean 429 rather than a half-open stream.
+    if (!hub.subscribe(accountId, sub)) {
+      res.status(429).json({ error: "too many connections for account" });
+      return;
+    }
+
+    // SSE headers, flushed immediately (no buffering — see the file-level
+    // reverse-proxy note). Everything below runs synchronously through the first
+    // res.write, so no publish can interleave before the headers are on the wire.
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    // Initial reconcile event: the account's current latest seq. A client can
+    // compare this to its cursor and drain immediately, without waiting for the
+    // next write to fire an activity nudge.
+    res.write(frame("ready", { seq: store.latestSeq(accountId) }));
+
+    // Teardown on disconnect/close/error: stop the heartbeat and remove the
+    // subscription so a dead connection never leaks in the hub. Idempotent.
+    let cleaned = false;
+    const cleanup = (): void => {
+      if (cleaned) {
+        return;
+      }
+      cleaned = true;
+      clearInterval(heartbeat);
+      hub.unsubscribe(accountId, sub);
+    };
+
+    // Periodic heartbeat comment to keep the connection alive through idle
+    // proxy/LB timeouts. unref so a pending heartbeat never keeps the process
+    // alive on shutdown. A write failure here means the socket is gone: clean up.
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded) {
+        cleanup();
+        return;
+      }
+      try {
+        res.write(": heartbeat\n\n");
+      } catch {
+        cleanup();
+      }
+    }, heartbeatMs);
+    heartbeat.unref();
+
+    res.on("close", cleanup);
+    res.on("error", cleanup);
+  });
+
+  return router;
+}

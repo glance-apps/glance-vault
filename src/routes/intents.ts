@@ -1,5 +1,6 @@
 import { Router, json, type Request, type Response } from "express";
 import type { Store, IntentEventInput, IntentEventRecord } from "../storage/types.js";
+import type { Emit } from "../realtime/hub.js";
 
 const DEFAULT_LIMIT = 500;
 const MAX_LIMIT = 1000;
@@ -52,7 +53,13 @@ function normalizeExpiresAt(value: unknown): string | null {
 // per-client receive cursor: the client owns its receive cursor and lists since
 // a value it supplies. Intents carry no app path param: they are the cross-app
 // channel between the apps, so they are account scoped only.
-export function intentsRouter(store: Store): Router {
+// emit is the best-effort real-time push hook (Phase 9), same contract as the
+// sync router: after a landed intent advances the account seq, nudge connected
+// SSE clients for that account to drain. Intents share the SAME per-account seq
+// source as sync, so this is the same "activity" nudge — a nudged client drains
+// both sync and intents. Post-commit, non-throwing, non-blocking; never gates
+// the write.
+export function intentsRouter(store: Store, emit: Emit): Router {
   const router = Router();
 
   // Insert a batch of intent events. Body: { accountId, events: [{ eventId,
@@ -102,6 +109,11 @@ export function intentsRouter(store: Store): Router {
     }
 
     const result = store.insertIntents(body.accountId, events);
+    // Nudge connected clients only when a new intent actually landed (maxSeq is
+    // 0 when every event was an insert-only re-send). Post-commit, best-effort.
+    if (result.maxSeq > 0) {
+      emit(body.accountId, { seq: result.maxSeq });
+    }
     res.status(200).json(result);
   });
 

@@ -12,12 +12,12 @@ docker pull ghcr.io/glance-apps/glance-vault:latest
 Images are published to the GitHub Container Registry on every push to `main`,
 tagged with both `latest` and the short commit SHA.
 
-Status: Phase 1 complete (sync transport), plus the salt store that Phase 3
-(the client-side database transport) depends on. The server builds, runs, holds
-the schema, authenticates a device token, serves the sync transport endpoints,
-and stores one key-derivation salt per account. Intents and media endpoints are
-not implemented yet; those are later phases. See
-`docs/GLANCEvault-server-spec.md` for the full design and build plan.
+Status: the sync transport, cross-device intents, the salt store, the
+content-addressed media/blob store, and server-side real-time push (SSE) are
+implemented. The server builds, runs, holds the schema, authenticates a device
+token, serves those endpoints, and stores one key-derivation salt per account.
+Client-side consumption of the push channel is a later step; clients still poll
+today. See `docs/GLANCEvault-server-spec.md` for the full design and build plan.
 
 ## What Phase 0 includes
 
@@ -125,7 +125,12 @@ Caddy gives you automatic HTTPS. A minimal `Caddyfile` stanza:
 
 ```
 vault.example.com {
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy 127.0.0.1:8080 {
+        # Required for the SSE push endpoint (GET /events): stream nudges to the
+        # client immediately instead of buffering them. Without this the
+        # real-time push degrades to the polling backstop.
+        flush_interval -1
+    }
 }
 ```
 
@@ -133,6 +138,13 @@ Then point the GLANCE apps at `https://vault.example.com`. If those apps run in 
 browser on a different origin, set `GLANCEVAULT_ALLOWED_ORIGINS` to their origins
 (for example `https://app.example.com`) so CORS permits them. The device token is
 sent in the `Authorization` header, so it rides over the proxy unchanged.
+
+The `flush_interval -1` line is required for the real-time push endpoint to work
+through the proxy. On nginx the equivalent is `proxy_buffering off` for the
+`/events` location (the server also sends `X-Accel-Buffering: no`, which nginx
+honors). Any reverse proxy in front of the server must disable response
+buffering for `/events`, or SSE nudges get batched and clients silently fall
+back to polling.
 
 ## Hit /healthz
 
@@ -143,7 +155,7 @@ curl http://localhost:8080/healthz
 Expected response:
 
 ```json
-{ "status": "ok", "version": "0.1.0", "schemaVersion": 1 }
+{ "status": "ok", "version": "0.1.0", "schemaVersion": 3 }
 ```
 
 ## Sync transport endpoints
@@ -227,6 +239,57 @@ curl -s -X PUT http://localhost:8080/salt/house-1 \
 
 # Any device can fetch it.
 curl -s http://localhost:8080/salt/house-1 -H "Authorization: Bearer $TOKEN"
+```
+
+## Real-time push (SSE)
+
+`GET /events?accountId=...` is an authenticated, account-scoped [Server-Sent
+Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+stream. It carries a **nudge only** — "your account is now at seq N, go sync" —
+never any payload, plaintext, or row content. It uses the same device token and
+the same `accountId` scoping as every other route, so a token for one account
+only ever receives that account's nudges. Push is an optimization layered over
+the existing sync/intents transport; **polling remains the delivery backstop**,
+so if the connection drops nothing is lost — the client catches up on its next
+poll (spec §14).
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/events?accountId=...` | Subscribe to the account's push nudges (SSE) |
+
+Events on the wire:
+
+- `event: ready` — sent once on connect. `data: {"seq": N}` where `N` is the
+  account's current latest seq. A just-connected client compares this to its
+  cursor and drains immediately, without waiting for the next write.
+- `event: activity` — sent whenever a write advances the account seq: a sync
+  batch upsert, a sync soft-delete, or a landed intent. `data: {"seq": N}` with
+  the account's latest seq. Sync and intents share one per-account seq, so this
+  single nudge covers both; the client drains sync and intents together.
+- `: heartbeat` — an SSE comment line sent every ~20s to keep the connection
+  alive through idle proxy/load-balancer timeouts. Clients ignore it.
+
+Emission is best-effort and post-commit: a nudge fires only after the write is
+durably committed, and a slow or dead connection is dropped, never allowed to
+block or fail the underlying write. The pub/sub is in-process and
+single-container by design; horizontally-scaled push is deferred with the paid
+product (spec §13, §14.3).
+
+> **Reverse proxy:** the `/events` response must not be buffered. Configure
+> Caddy with `flush_interval -1` (or nginx with `proxy_buffering off`) as shown
+> in [Behind Caddy](#behind-caddy), or nudges are batched and clients fall back
+> to polling.
+
+```
+# Subscribe to account "house-1" (streams until interrupted).
+curl -N http://localhost:8080/events?accountId=house-1 \
+  -H "Authorization: Bearer $TOKEN"
+# event: ready
+# data: {"seq":0}
+#
+# ... after another device writes ...
+# event: activity
+# data: {"seq":3}
 ```
 
 ## Scripts
