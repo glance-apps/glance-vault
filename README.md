@@ -12,12 +12,12 @@ docker pull ghcr.io/glance-apps/glance-vault:latest
 Images are published to the GitHub Container Registry on every push to `main`,
 tagged with both `latest` and the short commit SHA.
 
-Status: Phase 1 complete (sync transport), plus the salt store that Phase 3
-(the client-side database transport) depends on. The server builds, runs, holds
-the schema, authenticates a device token, serves the sync transport endpoints,
-and stores one key-derivation salt per account. Intents and media endpoints are
-not implemented yet; those are later phases. See
-`docs/GLANCEvault-server-spec.md` for the full design and build plan.
+Status: the sync transport, cross-device intents, the salt store, the
+content-addressed media/blob store, and server-side real-time push (SSE) are
+implemented. The server builds, runs, holds the schema, authenticates a device
+token, serves those endpoints, and stores one key-derivation salt per account.
+Client-side consumption of the push channel is a later step; clients still poll
+today. See `docs/GLANCEvault-server-spec.md` for the full design and build plan.
 
 ## What Phase 0 includes
 
@@ -155,7 +155,7 @@ curl http://localhost:8080/healthz
 Expected response:
 
 ```json
-{ "status": "ok", "version": "0.1.0", "schemaVersion": 1 }
+{ "status": "ok", "version": "0.1.0", "schemaVersion": 3 }
 ```
 
 ## Sync transport endpoints
