@@ -18,6 +18,32 @@ import type {
 } from "./types.js";
 import { runMigrations, currentVersion } from "./migrations.js";
 
+// Turn a failure to create/open the database file into an actionable message.
+// The raw better-sqlite3 error ("unable to open database file", SQLITE_CANTOPEN)
+// and a bare EACCES from mkdir are almost always a volume-permissions problem:
+// the process user cannot write the data directory. This is common under Docker
+// when the container runs as a custom uid/gid (e.g. Unraid's 99:100) that does
+// not own the mounted volume. Point the operator at the fix rather than leaving
+// them with an opaque native stack trace.
+function permissionHint(storagePath: string, err: unknown): Error {
+  const code = (err as { code?: string } | null)?.code;
+  const likelyPermissions = code === "SQLITE_CANTOPEN" || code === "EACCES" || code === "EPERM";
+  const dir = dirname(storagePath);
+  const detail = err instanceof Error ? err.message : String(err);
+  if (!likelyPermissions) {
+    return err instanceof Error ? err : new Error(detail);
+  }
+  return new Error(
+    `Could not open the database at ${storagePath}: ${detail}. ` +
+      `The data directory (${dir}) is not writable by this process ` +
+      `(uid ${process.getuid?.() ?? "?"}, gid ${process.getgid?.() ?? "?"}). ` +
+      `In Docker, run the container as a user that owns the mounted directory: ` +
+      `set 'user: "<uid>:<gid>"' in your compose file to match the directory's ` +
+      `owner (for example user: "99:100" with a host directory you own on ` +
+      `Unraid), or make the mounted directory writable by this uid.`,
+  );
+}
+
 // Shape of a sync_rows row as it comes back from better-sqlite3. envelope is a
 // Buffer (BLOB) and deleted is a 0/1 integer.
 interface SyncRowDb {
@@ -92,9 +118,17 @@ export class SqliteStore implements Store {
     // ":memory:" is supported for tests; for a file path ensure its directory
     // exists so a fresh, empty volume works on first boot.
     if (storagePath !== ":memory:") {
-      mkdirSync(dirname(storagePath), { recursive: true });
+      try {
+        mkdirSync(dirname(storagePath), { recursive: true });
+      } catch (err) {
+        throw permissionHint(storagePath, err);
+      }
     }
-    this.db = new Database(storagePath);
+    try {
+      this.db = new Database(storagePath);
+    } catch (err) {
+      throw permissionHint(storagePath, err);
+    }
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     // Wait up to 5 seconds for a competing writer rather than failing fast.

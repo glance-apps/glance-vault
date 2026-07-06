@@ -26,7 +26,10 @@ services:
       GLANCEVAULT_PORT: "8080"
       GLANCEVAULT_STORAGE_PATH: /data/glancevault.db
     volumes:
-      # Named volume holding the SQLite database file.
+      # Named volume holding the SQLite database file. To run as a non-default
+      # user (e.g. Unraid's nobody:users, 99:100), use a bind mount you own on
+      # the host plus a `user: "99:100"` line instead — see "Running as a
+      # specific user" in the README.
       - glancevault-data:/data
 
 volumes:

@@ -31,6 +31,10 @@ services:
       GLANCEVAULT_STORAGE_PATH: /data/glancevault.db
     volumes:
       # Named volume holding the SQLite database file, so it survives restarts.
+      # To run as a non-default user (e.g. Unraid's nobody:users, 99:100),
+      # replace this with a bind mount you own on the host and add a
+      # `user: "99:100"` line above — see "Running as a specific user" in the
+      # README.
       - glancevault-data:/data
     healthcheck:
       # Hit the public /healthz endpoint using the node runtime in the image.
