@@ -119,6 +119,36 @@ The server port is published on `127.0.0.1` only, so it is reached through a
 TLS-terminating reverse proxy rather than exposed directly. To pick up a new
 image after a push to `main`, run `docker compose pull && docker compose up -d`.
 
+### Running as a specific user (file permissions)
+
+The SQLite file lives on the mounted data volume, so the container's user has to
+be able to write that directory. When it cannot, better-sqlite3 fails on boot
+with `unable to open database file` (`SQLITE_CANTOPEN`).
+
+Out of the box the container runs as the image's `node` user (uid/gid
+`1000:1000`), which owns the named volume the compose files create — so the
+default setup needs no configuration. If you need the server to run as a
+different user (for example NAS platforms like Unraid, which expect
+`nobody:users`, `99:100`), use Docker's own `user:` directive against a **bind
+mount you own on the host** rather than a named volume:
+
+```yaml
+services:
+  glancevault:
+    image: ghcr.io/glance-apps/glance-vault:latest
+    user: "99:100"                 # match the owner of the directory below
+    volumes:
+      - /mnt/user/appdata/glancevault:/data   # a host dir owned by 99:100
+    # ...device token, ports, etc. as in docker-compose.yml
+```
+
+A bind mount uses the host directory's ownership directly, so as long as that
+directory is owned by (or writable by) the uid you run as, the server can create
+the database with no extra steps. This is why a bind mount — not a named volume —
+is the right choice here: a fresh named volume inherits the image's ownership
+(`node`), which a different uid can't write. On Unraid the appdata directory is
+already `nobody:users`, so `user: "99:100"` with a bind mount into it just works.
+
 ### Behind Caddy
 
 Caddy gives you automatic HTTPS. A minimal `Caddyfile` stanza:
