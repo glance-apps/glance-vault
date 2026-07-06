@@ -53,6 +53,7 @@ built-in defaults.
 | Listen port | `GLANCEVAULT_PORT` | `port` | `8080` |
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
 | Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
+| Request logging | `GLANCEVAULT_REQUEST_LOG` | `requestLog` | on |
 
 `GLANCEVAULT_ALLOWED_ORIGINS` is a comma-separated list of origins; the
 `allowedOrigins` config file field is an array. The environment variable wins
@@ -63,6 +64,13 @@ preflight.
 
 The config file path defaults to `./config.json` and can be overridden with
 `GLANCEVAULT_CONFIG`. See `config.example.json` and `.env.example`.
+
+Request logging is on by default: the server prints one concise line per
+request (method, path, status, duration), skipping the `/healthz` health check
+so it does not drown out real traffic. This is the first thing to check when a
+client "does nothing" — if no line appears when the client acts, the request
+never reached the server (see [Connecting a browser app](#connecting-a-browser-app)).
+Set `GLANCEVAULT_REQUEST_LOG=off` to silence it.
 
 ### The device token
 
@@ -175,6 +183,28 @@ through the proxy. On nginx the equivalent is `proxy_buffering off` for the
 honors). Any reverse proxy in front of the server must disable response
 buffering for `/events`, or SSE nudges get batched and clients silently fall
 back to polling.
+
+### Connecting a browser app
+
+The GLANCE apps run in the browser, so a browser-enforced rule — not the vault
+server — is the usual reason a client can reach the vault yet "Save does
+nothing" with no obvious error. Two things to get right:
+
+- **CORS.** A browser app served from a different origin than the vault must be
+  allow-listed, or the browser blocks the request before the app sees a
+  response. Set `GLANCEVAULT_ALLOWED_ORIGINS` to the app's origin (for example
+  `https://app.example.com`). With it unset, no cross-origin request is allowed.
+- **No mixed content.** A page loaded over `https://` cannot call a vault at
+  `http://…`; the browser blocks the insecure request silently. Serve the vault
+  over HTTPS (see [Behind Caddy](#behind-caddy)) and enter its `https://` URL in
+  the app. Pointing an HTTPS app at a plain `http://host:8080` vault will fail
+  with nothing shown in the app.
+
+When a save or sync "does nothing," open the browser's DevTools **Console** and
+**Network** tabs and retry: a CORS or mixed-content block shows up there. Cross-
+check the server side with request logging (on by default, see
+[Configuration](#configuration)) — if no line is logged when the client acts,
+the request never left the browser, which points at one of the two rules above.
 
 ## Hit /healthz
 

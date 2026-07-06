@@ -5,6 +5,7 @@ import type { BlobStore } from "./storage/blobstore.js";
 import { DiskBlobStore } from "./storage/disk-blobstore.js";
 import { deviceTokenAuth } from "./middleware/auth.js";
 import { cors } from "./middleware/cors.js";
+import { requestLog } from "./middleware/request-log.js";
 import { healthRouter } from "./routes/health.js";
 import { syncRouter } from "./routes/sync.js";
 import { intentsRouter } from "./routes/intents.js";
@@ -37,6 +38,14 @@ export function buildApp(
   hub: AccountHub = new InProcessAccountHub(),
 ): Express {
   const app = express();
+
+  // Request logging runs first so it captures every request, including a CORS
+  // preflight (answered by the cors middleware) and an auth rejection. Enabled
+  // by loadConfig (default on); left off when config.requestLog is unset, which
+  // keeps test output quiet since the test config literals omit it.
+  if (config.requestLog) {
+    app.use(requestLog());
+  }
 
   app.use(cors(config.allowedOrigins));
 

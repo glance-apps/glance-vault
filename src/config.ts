@@ -45,6 +45,12 @@ export interface Config {
   // is heavier than the lazy intents prune, so it runs on a schedule rather than
   // on a request hot path. Default 1 hour.
   blobReclaimIntervalMs?: number;
+  // Whether to log one concise line per request (method, path, status, duration).
+  // DEFAULT ON: it is the operator's first tool for diagnosing "the client does
+  // nothing" reports. Optional in the type so test config literals may omit it
+  // (and thereby keep logging off in tests); loadConfig always resolves a
+  // concrete value.
+  requestLog?: boolean;
 }
 
 interface FileConfig {
@@ -60,6 +66,7 @@ interface FileConfig {
   blobGracePeriodDays?: number;
   blobDeadDevicePeriodDays?: number;
   blobReclaimIntervalMinutes?: number;
+  requestLog?: boolean;
 }
 
 const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
@@ -184,6 +191,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     "GLANCEVAULT_BLOB_RECLAIM_INTERVAL_MINUTES",
   );
 
+  // Request logging. DEFAULT ON. Any of off/false/0/no (case-insensitive) turns
+  // it off; anything else leaves it on. Env wins over the file over the default.
+  const requestLogEnv = env.GLANCEVAULT_REQUEST_LOG;
+  let requestLog: boolean;
+  if (requestLogEnv !== undefined) {
+    requestLog = !["off", "false", "0", "no"].includes(requestLogEnv.trim().toLowerCase());
+  } else if (typeof file.requestLog === "boolean") {
+    requestLog = file.requestLog;
+  } else {
+    requestLog = true;
+  }
+
   return {
     storagePath,
     port,
@@ -195,6 +214,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     blobGracePeriodMs,
     blobDeadDevicePeriodMs,
     blobReclaimIntervalMs,
+    requestLog,
   };
 }
 
