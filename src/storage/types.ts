@@ -10,6 +10,10 @@ export interface SyncRowInput {
   deleted: boolean;
   createdAt?: number;
   insertOnly?: boolean;
+  // Client-supplied tombstone timestamp (epoch milliseconds), only meaningful on
+  // a deleted row. Optional: omitted on non-deletes and on legacy clients. The
+  // server persists it verbatim into sync_rows.deleted_at and never orders on it.
+  deletedAt?: number;
 }
 
 // A stored row as returned to a client. envelope stays opaque bytes here; the
@@ -20,6 +24,10 @@ export interface SyncRowRecord {
   seq: number;
   deleted: boolean;
   serverMtime: string;
+  // Client-supplied tombstone timestamp (epoch milliseconds), or null when the
+  // row is live or was deleted by a legacy client that sent no timestamp. Clients
+  // treat null as "delete wins"; a present value drives tombstone LWW.
+  deletedAt: number | null;
 }
 
 export interface BatchResult {
@@ -180,10 +188,16 @@ export interface Store {
   // Fetch a single row by entity_id, or null if it does not exist.
   getRow(app: string, accountId: string, entityId: string): SyncRowRecord | null;
 
-  // Soft-delete a row: mark deleted, assign a new seq, and update server_mtime,
-  // all in one transaction. Returns the new seq, or null if the row does not
-  // exist.
-  softDeleteRow(app: string, accountId: string, entityId: string): { seq: number } | null;
+  // Soft-delete a row: mark deleted, assign a new seq, update server_mtime, and
+  // record the client-supplied deletedAt (epoch ms; null when the client omits
+  // it), all in one transaction. Returns the new seq, or null if the row does
+  // not exist.
+  softDeleteRow(
+    app: string,
+    accountId: string,
+    entityId: string,
+    deletedAt?: number | null,
+  ): { seq: number } | null;
 
   // Insert a batch of intent events for one account. INSERT-ONLY: a re-sent
   // event_id is a harmless no-op (INSERT ... ON CONFLICT (account_id, event_id)
@@ -283,6 +297,12 @@ export interface Store {
   // Delete a session and its part records (on finalize success or abort). The
   // staged part BYTES are removed separately via the BlobStore.
   deleteUploadSession(uploadId: string): void;
+
+  // List upload sessions created at or before the cutoff (an ISO timestamp),
+  // for the stale-session reaper. Returns the uploadId and accountId of each so
+  // the caller can discard the staged bytes (BlobStore) and delete the row.
+  // READ ONLY: deletes nothing itself.
+  listStaleUploadSessions(cutoff: string): { uploadId: string; accountId: string }[];
 
   // --- Blob reclaim / garbage collection (Phase 7 final step) ---
 

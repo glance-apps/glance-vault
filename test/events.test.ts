@@ -385,6 +385,28 @@ test("hub enforces a per-account connection cap", () => {
   assert.equal(hub.connectionCount("acct"), 2);
 });
 
+test("hub enforces a global connection cap across accounts", () => {
+  // High per-account cap, low GLOBAL cap: the ceiling must bind even when each
+  // account is well under its own limit and connections spread across accounts
+  // (the vector a shared token opens by varying accountId).
+  const hub = new InProcessAccountHub(100, 3);
+  const subA = fakeSubscriber(1, []);
+  assert.equal(hub.subscribe("a", subA), true);
+  assert.equal(hub.subscribe("b", fakeSubscriber(2, [])), true);
+  assert.equal(hub.subscribe("c", fakeSubscriber(3, [])), true);
+  assert.equal(hub.totalConnections(), 3);
+  // Fourth connection, a brand-new account, is refused at the global ceiling.
+  assert.equal(hub.subscribe("d", fakeSubscriber(4, [])), false, "global cap refuses the 4th");
+  assert.equal(hub.totalConnections(), 3);
+  assert.equal(hub.connectionCount("d"), 0, "no empty set leaked for the refused account");
+
+  // Freeing a slot lets a new connection back in, and the counter tracks it.
+  hub.unsubscribe("a", subA);
+  assert.equal(hub.totalConnections(), 2);
+  assert.equal(hub.subscribe("d", fakeSubscriber(5, [])), true, "a freed slot admits a new connection");
+  assert.equal(hub.totalConnections(), 3);
+});
+
 // ======================================================================
 // SSE endpoint integration tests (auth, headers, initial seq, nudges,
 // isolation, heartbeat, clean disconnect) over real HTTP.

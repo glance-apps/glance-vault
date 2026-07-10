@@ -52,6 +52,7 @@ interface SyncRowDb {
   seq: number;
   deleted: number;
   server_mtime: string;
+  deleted_at: number | null;
 }
 
 function toRecord(row: SyncRowDb): SyncRowRecord {
@@ -61,6 +62,7 @@ function toRecord(row: SyncRowDb): SyncRowRecord {
     seq: row.seq,
     deleted: row.deleted !== 0,
     serverMtime: row.server_mtime,
+    deletedAt: row.deleted_at ?? null,
   };
 }
 
@@ -191,13 +193,14 @@ export class SqliteStore implements Store {
     // of advancing seq is that other devices re-pull identical bytes, which they
     // apply harmlessly.
     const upsert = this.db.prepare(
-      `INSERT INTO sync_rows (account_id, app, entity_id, seq, envelope, deleted, server_mtime)
-       VALUES (@account_id, @app, @entity_id, @seq, @envelope, @deleted, @server_mtime)
+      `INSERT INTO sync_rows (account_id, app, entity_id, seq, envelope, deleted, server_mtime, deleted_at)
+       VALUES (@account_id, @app, @entity_id, @seq, @envelope, @deleted, @server_mtime, @deleted_at)
        ON CONFLICT (account_id, app, entity_id) DO UPDATE SET
          envelope = excluded.envelope,
          seq = excluded.seq,
          deleted = excluded.deleted,
-         server_mtime = excluded.server_mtime`,
+         server_mtime = excluded.server_mtime,
+         deleted_at = excluded.deleted_at`,
     );
     // For insertOnly rows we check existence first so an already-present entity
     // is skipped without consuming a seq. The enclosing transaction is IMMEDIATE
@@ -225,6 +228,12 @@ export class SqliteStore implements Store {
           envelope: row.envelope,
           deleted: row.deleted ? 1 : 0,
           server_mtime: new Date().toISOString(),
+          // Only a deleted row carries a tombstone timestamp; a live upsert
+          // clears any prior value. Coerce a non-finite/absent value to null.
+          deleted_at:
+            row.deleted && typeof row.deletedAt === "number" && Number.isFinite(row.deletedAt)
+              ? row.deletedAt
+              : null,
         });
         written += 1;
         if (seq > maxSeq) {
@@ -240,7 +249,7 @@ export class SqliteStore implements Store {
   listRows(app: string, accountId: string, since: number, limit: number): ListResult {
     const dbRows = this.db
       .prepare(
-        `SELECT entity_id, envelope, seq, deleted, server_mtime
+        `SELECT entity_id, envelope, seq, deleted, server_mtime, deleted_at
          FROM sync_rows
          WHERE account_id = ? AND app = ? AND seq > ?
          ORDER BY seq ASC
@@ -256,7 +265,7 @@ export class SqliteStore implements Store {
   getRow(app: string, accountId: string, entityId: string): SyncRowRecord | null {
     const row = this.db
       .prepare(
-        `SELECT entity_id, envelope, seq, deleted, server_mtime
+        `SELECT entity_id, envelope, seq, deleted, server_mtime, deleted_at
          FROM sync_rows
          WHERE account_id = ? AND app = ? AND entity_id = ?`,
       )
@@ -264,9 +273,18 @@ export class SqliteStore implements Store {
     return row ? toRecord(row) : null;
   }
 
-  // Soft-delete: mark the row deleted, assign a new seq, and update server_mtime
-  // inside one transaction. Returns null if the row does not exist.
-  softDeleteRow(app: string, accountId: string, entityId: string): { seq: number } | null {
+  // Soft-delete: mark the row deleted, assign a new seq, update server_mtime, and
+  // record the client-supplied deletedAt (epoch ms) inside one transaction.
+  // deletedAt is null when the client omits it (legacy clients / delete-wins).
+  // Returns null if the row does not exist.
+  softDeleteRow(
+    app: string,
+    accountId: string,
+    entityId: string,
+    deletedAt: number | null = null,
+  ): { seq: number } | null {
+    const deletedAtValue =
+      typeof deletedAt === "number" && Number.isFinite(deletedAt) ? deletedAt : null;
     return this.transaction(() => {
       const existing = this.db
         .prepare(
@@ -280,10 +298,10 @@ export class SqliteStore implements Store {
       this.db
         .prepare(
           `UPDATE sync_rows
-           SET deleted = 1, seq = ?, server_mtime = ?
+           SET deleted = 1, seq = ?, server_mtime = ?, deleted_at = ?
            WHERE account_id = ? AND app = ? AND entity_id = ?`,
         )
-        .run(seq, new Date().toISOString(), accountId, app, entityId);
+        .run(seq, new Date().toISOString(), deletedAtValue, accountId, app, entityId);
       return { seq };
     });
   }
@@ -602,6 +620,17 @@ export class SqliteStore implements Store {
   // staged part bytes are removed separately via the BlobStore.
   deleteUploadSession(uploadId: string): void {
     this.db.prepare(`DELETE FROM blob_upload_sessions WHERE upload_id = ?`).run(uploadId);
+  }
+
+  // Sessions created at or before the cutoff — the stale set the reaper sweeps.
+  // Read-only; the caller discards the staged bytes and then deletes each row.
+  listStaleUploadSessions(cutoff: string): { uploadId: string; accountId: string }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT upload_id, account_id FROM blob_upload_sessions WHERE created_at <= ?`,
+      )
+      .all(cutoff) as { upload_id: string; account_id: string }[];
+    return rows.map((r) => ({ uploadId: r.upload_id, accountId: r.account_id }));
   }
 
   // --- Blob reclaim (Phase 7 final step) ---

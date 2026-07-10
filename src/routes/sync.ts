@@ -18,6 +18,9 @@ function serializeRow(row: SyncRowRecord) {
     seq: row.seq,
     deleted: row.deleted,
     serverMtime: row.serverMtime,
+    // Client-supplied tombstone timestamp for tombstone LWW; null on live rows
+    // and on tombstones written by a client that predates deletedAt.
+    deletedAt: row.deletedAt,
   };
 }
 
@@ -89,6 +92,7 @@ export function syncRouter(store: Store, emit: Emit): Router {
         deleted?: unknown;
         createdAt?: unknown;
         insertOnly?: unknown;
+        deletedAt?: unknown;
       };
       if (typeof raw.entityId !== "string" || raw.entityId.trim() === "") {
         res.status(400).json({ error: `rows[${i}].entityId is required` });
@@ -106,12 +110,20 @@ export function syncRouter(store: Store, emit: Emit): Router {
         res.status(400).json({ error: `rows[${i}].insertOnly must be a boolean` });
         return;
       }
+      if (
+        raw.deletedAt !== undefined &&
+        (typeof raw.deletedAt !== "number" || !Number.isInteger(raw.deletedAt) || raw.deletedAt < 0)
+      ) {
+        res.status(400).json({ error: `rows[${i}].deletedAt must be a non-negative integer` });
+        return;
+      }
       rows.push({
         entityId: raw.entityId,
         envelope: Buffer.from(raw.envelope, "base64"),
         deleted: raw.deleted === true,
         createdAt: typeof raw.createdAt === "number" ? raw.createdAt : undefined,
         insertOnly: raw.insertOnly === true,
+        deletedAt: typeof raw.deletedAt === "number" ? raw.deletedAt : undefined,
       });
     }
 
@@ -226,14 +238,26 @@ export function syncRouter(store: Store, emit: Emit): Router {
     res.status(200).json(serializeRow(row));
   });
 
-  // Soft-delete a row: mark deleted, assign a new seq. Query: accountId.
+  // Soft-delete a row: mark deleted, assign a new seq. Query: accountId, and an
+  // optional deletedAt (epoch ms) the client v1.6.0 sends so the tombstone can
+  // drive last-writer-wins. Absent/invalid deletedAt is stored as null, which
+  // clients read as delete-wins (legacy semantics).
   router.delete("/:app/:entityId", (req: Request, res: Response) => {
     const accountId = queryAccountId(req);
     if (accountId === null) {
       res.status(400).json({ error: "accountId is required" });
       return;
     }
-    const result = store.softDeleteRow(req.params.app, accountId, req.params.entityId);
+    let deletedAt: number | null = null;
+    if (req.query.deletedAt !== undefined) {
+      const parsed = Number(req.query.deletedAt);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        res.status(400).json({ error: "deletedAt must be a non-negative integer" });
+        return;
+      }
+      deletedAt = parsed;
+    }
+    const result = store.softDeleteRow(req.params.app, accountId, req.params.entityId, deletedAt);
     if (result === null) {
       res.status(404).json({ error: "not found" });
       return;

@@ -54,6 +54,13 @@ built-in defaults.
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
 | Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
 | Request logging | `GLANCEVAULT_REQUEST_LOG` | `requestLog` | on |
+| Trust proxy | `GLANCEVAULT_TRUST_PROXY` | `trustProxy` | `loopback` |
+| Per-IP rate limiting | `GLANCEVAULT_RATE_LIMIT` | `rateLimit` | on |
+| Rate-limit window (s) | `GLANCEVAULT_RATE_LIMIT_WINDOW_SECONDS` | `rateLimitWindowSeconds` | 60 |
+| Rate-limit max/window | `GLANCEVAULT_RATE_LIMIT_MAX` | `rateLimitMax` | 600 |
+| Max SSE connections (total) | `GLANCEVAULT_MAX_SSE_CONNECTIONS` | `maxSseConnections` | 1024 |
+| Upload-session TTL (h) | `GLANCEVAULT_UPLOAD_SESSION_TTL_HOURS` | `uploadSessionTtlHours` | 24 |
+| Upload-session sweep (min) | `GLANCEVAULT_UPLOAD_SESSION_SWEEP_MINUTES` | `uploadSessionSweepMinutes` | 60 |
 
 `GLANCEVAULT_ALLOWED_ORIGINS` is a comma-separated list of origins; the
 `allowedOrigins` config file field is an array. The environment variable wins
@@ -61,6 +68,23 @@ over the file. When neither is set, no cross-origin requests are allowed. A
 single `*` entry allows any origin. Preflight OPTIONS requests are answered
 before auth, so browser clients work without sending the device token on the
 preflight.
+
+Every client that connects cross-origin must be listed. That includes the
+dayGLANCE **Electron desktop** app, whose renderer sends `Origin: app://dayglance`
+— omit it and the desktop app's SSE/`fetch` is blocked by the browser engine and
+it silently degrades to polling. A typical allow list is
+`app://dayglance,https://app.example.com` (replace the second entry with your
+real production web origin(s)). See `config.example.json` / `.env.example`.
+
+**Abuse limits.** Per-IP rate limiting is on by default (a coarse backstop on top
+of the reverse proxy; default 600 requests/IP/minute, `429` with `Retry-After`
+past that). Because the server runs behind a TLS-terminating proxy, `req.ip` is
+only correct when Express is told which hop to trust: `GLANCEVAULT_TRUST_PROXY`
+defaults to `loopback` (a proxy on localhost, matching the compose setup). Set it
+to a hop count (e.g. `1`) if your topology differs. `/events` (SSE) is additionally
+bounded by a per-account cap (64) and a process-wide total cap
+(`GLANCEVAULT_MAX_SSE_CONNECTIONS`, default 1024); an over-cap connection gets a
+clean `429`.
 
 The config file path defaults to `./config.json` and can be overridden with
 `GLANCEVAULT_CONFIG`. See `config.example.json` and `.env.example`.
@@ -173,9 +197,10 @@ vault.example.com {
 ```
 
 Then point the GLANCE apps at `https://vault.example.com`. If those apps run in a
-browser on a different origin, set `GLANCEVAULT_ALLOWED_ORIGINS` to their origins
-(for example `https://app.example.com`) so CORS permits them. The device token is
-sent in the `Authorization` header, so it rides over the proxy unchanged.
+browser or the Electron desktop app on a different origin, set
+`GLANCEVAULT_ALLOWED_ORIGINS` to their origins (for example
+`app://dayglance,https://app.example.com`) so CORS permits them. The device token
+is sent in the `Authorization` header, so it rides over the proxy unchanged.
 
 The `flush_interval -1` line is required for the real-time push endpoint to work
 through the proxy. On nginx the equivalent is `proxy_buffering off` for the
@@ -183,6 +208,14 @@ through the proxy. On nginx the equivalent is `proxy_buffering off` for the
 honors). Any reverse proxy in front of the server must disable response
 buffering for `/events`, or SSE nudges get batched and clients silently fall
 back to polling.
+
+Because per-IP rate limiting keys on the client address, the proxy must forward
+`X-Forwarded-For` and the server must trust it. `GLANCEVAULT_TRUST_PROXY` defaults
+to `loopback`, which is correct when the proxy runs on the same host and connects
+over localhost (the compose default). Caddy and nginx both set
+`X-Forwarded-For` automatically; if you front the server with additional hops,
+set `GLANCEVAULT_TRUST_PROXY` to the number of trusted proxies so a client cannot
+spoof its address and evade the limit.
 
 ### Connecting a browser app
 
@@ -194,6 +227,9 @@ nothing" with no obvious error. Two things to get right:
   allow-listed, or the browser blocks the request before the app sees a
   response. Set `GLANCEVAULT_ALLOWED_ORIGINS` to the app's origin (for example
   `https://app.example.com`). With it unset, no cross-origin request is allowed.
+  The Electron desktop app counts here too: its renderer's origin is
+  `app://dayglance`, so include it in the list or the desktop app's real-time
+  push (and every `fetch`) is blocked and it falls back to polling.
 - **No mixed content.** A page loaded over `https://` cannot call a vault at
   `http://…`; the browser blocks the insecure request silently. Serve the vault
   over HTTPS (see [Behind Caddy](#behind-caddy)) and enter its `https://` URL in
