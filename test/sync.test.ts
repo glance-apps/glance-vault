@@ -55,6 +55,7 @@ interface WireRow {
   seq: number;
   deleted: boolean;
   serverMtime: string;
+  deletedAt: number | null;
 }
 
 async function postBatch(
@@ -332,6 +333,67 @@ test("soft-delete marks the row deleted and advances its seq", async () => {
       { method: "DELETE", headers: authHeaders() },
     );
     assert.equal(missing.status, 404);
+  } finally {
+    h.close();
+  }
+});
+
+// 5a-bis. deletedAt (tombstone LWW): a soft-delete carries an optional deletedAt
+// (epoch ms) query param the client v1.6.0 sends. The server persists it and
+// returns it on list and single-row GET. A legacy delete (no param) stores null,
+// which the client reads as delete-wins. Live rows always carry deletedAt: null.
+test("soft-delete persists and returns the client-supplied deletedAt", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-deletedat";
+    await postBatch(h.base, "dayglance", account, [
+      { entityId: "with-ts", envelope: garbageEnvelope() },
+      { entityId: "legacy", envelope: garbageEnvelope() },
+    ]);
+
+    // A live row reports deletedAt: null.
+    const liveList = await listRows(h.base, "dayglance", account, 0);
+    for (const row of liveList.body.rows) {
+      assert.equal(row.deletedAt, null, "a live row has no tombstone timestamp");
+    }
+
+    // Delete WITH deletedAt: it is stored and returned on both list and GET.
+    const ts = 1_752_000_000_000; // a fixed epoch-ms instant
+    const delRes = await fetch(
+      `${h.base}/sync/dayglance/with-ts?accountId=${account}&deletedAt=${ts}`,
+      { method: "DELETE", headers: authHeaders() },
+    );
+    assert.equal(delRes.status, 200);
+
+    const gotWith = await getRow(h.base, "dayglance", account, "with-ts");
+    assert.equal(gotWith.status, 200);
+    assert.equal((gotWith.body as WireRow).deleted, true);
+    assert.equal((gotWith.body as WireRow).deletedAt, ts, "deletedAt round-trips on GET");
+
+    // Delete WITHOUT deletedAt (legacy client): stored as null.
+    const delLegacy = await fetch(
+      `${h.base}/sync/dayglance/legacy?accountId=${account}`,
+      { method: "DELETE", headers: authHeaders() },
+    );
+    assert.equal(delLegacy.status, 200);
+    const gotLegacy = await getRow(h.base, "dayglance", account, "legacy");
+    assert.equal((gotLegacy.body as WireRow).deleted, true);
+    assert.equal((gotLegacy.body as WireRow).deletedAt, null, "a legacy delete stores null (delete-wins)");
+
+    // An invalid deletedAt is rejected with 400.
+    const bad = await fetch(
+      `${h.base}/sync/dayglance/with-ts?accountId=${account}&deletedAt=not-a-number`,
+      { method: "DELETE", headers: authHeaders() },
+    );
+    assert.equal(bad.status, 400);
+
+    // A re-upsert of the entity as a live row clears the tombstone timestamp.
+    await postBatch(h.base, "dayglance", account, [
+      { entityId: "with-ts", envelope: garbageEnvelope() },
+    ]);
+    const revived = await getRow(h.base, "dayglance", account, "with-ts");
+    assert.equal((revived.body as WireRow).deleted, false);
+    assert.equal((revived.body as WireRow).deletedAt, null, "reviving a row clears deletedAt");
   } finally {
     h.close();
   }

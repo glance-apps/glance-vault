@@ -3,6 +3,7 @@ import { SqliteStore } from "./storage/sqlite.js";
 import { DiskBlobStore } from "./storage/disk-blobstore.js";
 import { buildApp } from "./server.js";
 import { reclaimSweep } from "./reclaim.js";
+import { reapUploadSessions } from "./upload-reaper.js";
 import { SERVER_VERSION, SCHEMA_VERSION } from "./version.js";
 import { TARGET_SCHEMA_VERSION } from "./storage/migrations.js";
 
@@ -63,11 +64,25 @@ function main(): void {
     );
   }
 
+  // Stale-upload-session reaper. ALWAYS ON (it only ever removes abandoned
+  // transfer-layer scratch — a never-finalized session and its staged part bytes
+  // — never a finalized blob or a synced row), so it needs no operator opt-in.
+  // unref() so a pending sweep never keeps the process alive on shutdown.
+  const uploadReaperTimer = setInterval(() => {
+    try {
+      reapUploadSessions(store, blobStore, config.uploadSessionTtlMs!);
+    } catch (err) {
+      console.error(`upload-reaper: sweep failed: ${String(err)}`);
+    }
+  }, config.uploadSessionSweepIntervalMs!);
+  uploadReaperTimer.unref();
+
   const shutdown = (signal: string) => {
     console.log(`Received ${signal}, shutting down.`);
     if (reclaimTimer) {
       clearInterval(reclaimTimer);
     }
+    clearInterval(uploadReaperTimer);
     server.close(() => {
       store.close();
       process.exit(0);

@@ -63,15 +63,35 @@ export interface AccountHub {
 // without bound. Tune via the constructor if ever needed.
 export const DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT = 64;
 
+// A process-wide ceiling on total live SSE connections across ALL accounts. The
+// per-account cap alone does not bound the registry, because a caller can open
+// connections under many distinct accountIds (accountId is caller-supplied, and
+// one device token authorizes them all in this trust model); without a global
+// cap that is an unbounded memory/file-descriptor growth vector. This ceiling
+// is far above any single-instance/household deployment and exists purely as a
+// backstop. Tune via the constructor for a larger deployment.
+export const DEFAULT_MAX_CONNECTIONS_TOTAL = 1024;
+
 export class InProcessAccountHub implements AccountHub {
   private readonly byAccount = new Map<string, Set<Subscriber>>();
   private readonly maxPerAccount: number;
+  private readonly maxTotal: number;
+  private total = 0;
 
-  constructor(maxPerAccount: number = DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT) {
+  constructor(
+    maxPerAccount: number = DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT,
+    maxTotal: number = DEFAULT_MAX_CONNECTIONS_TOTAL,
+  ) {
     this.maxPerAccount = maxPerAccount;
+    this.maxTotal = maxTotal;
   }
 
   subscribe(accountId: string, sub: Subscriber): boolean {
+    // Global ceiling first: refuse once the process is at its total-connection
+    // cap, regardless of which account is asking.
+    if (this.total >= this.maxTotal) {
+      return false;
+    }
     let set = this.byAccount.get(accountId);
     if (set === undefined) {
       set = new Set();
@@ -85,6 +105,7 @@ export class InProcessAccountHub implements AccountHub {
       return false;
     }
     set.add(sub);
+    this.total += 1;
     return true;
   }
 
@@ -93,7 +114,11 @@ export class InProcessAccountHub implements AccountHub {
     if (set === undefined) {
       return;
     }
-    set.delete(sub);
+    // Only adjust the global counter when a member was actually removed, so a
+    // repeated/idempotent unsubscribe cannot drive the count below zero.
+    if (set.delete(sub)) {
+      this.total -= 1;
+    }
     // Drop the account key entirely once its last connection is gone so the
     // registry does not accumulate empty sets for churned accounts.
     if (set.size === 0) {
@@ -123,10 +148,6 @@ export class InProcessAccountHub implements AccountHub {
   }
 
   totalConnections(): number {
-    let total = 0;
-    for (const set of this.byAccount.values()) {
-      total += set.size;
-    }
-    return total;
+    return this.total;
   }
 }

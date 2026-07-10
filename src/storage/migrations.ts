@@ -7,7 +7,8 @@ import type Database from "better-sqlite3";
 // Phase 0 (version 1) creates the three sync-model tables plus the per-account
 // sequence counter; version 2 adds the per-account key-derivation salt; version
 // 3 adds the Phase 7 content-addressed blob store (metadata + reference
-// tracking + resumable upload sessions).
+// tracking + resumable upload sessions); version 4 adds the nullable
+// sync_rows.deleted_at tombstone timestamp used for client-side tombstone LWW.
 //
 // envelope is an opaque BLOB. The server stores and returns these bytes intact
 // and never parses them.
@@ -48,6 +49,16 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX idx_intent_cursor ON intent_events (account_id, seq);
 
       -- Device cursors, for coordinated tombstone GC in a later phase.
+      --
+      -- TOMBSTONE-GC INVARIANT (for whoever implements the deferred GC): a
+      -- soft-delete row (sync_rows with deleted = 1) must NEVER be hard-deleted
+      -- while its seq is still above ANY registered device's last_seen_seq. A
+      -- device offline past its client-side tombstone horizon relies entirely on
+      -- these server rows to learn what was deleted; removing a delete row whose
+      -- seq exceeds a lagging (or merely stale-but-registered) cursor causes that
+      -- device to resurrect deleted entities on reconnect. Only ages-out a device
+      -- from the min(last_seen_seq) calculation once it is provably dead (see spec
+      -- section 9); never drop a delete row on a live/registered cursor's watch.
       CREATE TABLE devices (
         account_id    TEXT    NOT NULL,
         device_id     TEXT    NOT NULL,
@@ -134,6 +145,19 @@ const MIGRATIONS: Migration[] = [
         PRIMARY KEY (upload_id, part_index),
         FOREIGN KEY (upload_id) REFERENCES blob_upload_sessions (upload_id) ON DELETE CASCADE
       );
+    `,
+  },
+  {
+    version: 4,
+    sql: `
+      -- Client-supplied tombstone timestamp (epoch milliseconds) recorded when a
+      -- row is soft-deleted. Nullable and never backfilled: rows deleted before
+      -- this column existed (and any client that omits it) carry NULL, which the
+      -- sync client reads as "delete wins" — the correct legacy semantics. When
+      -- present, the client uses it for tombstone last-writer-wins against a
+      -- concurrent edit. The server only stores and returns it; it never orders
+      -- or merges on it (ordering stays purely by seq).
+      ALTER TABLE sync_rows ADD COLUMN deleted_at INTEGER;
     `,
   },
 ];

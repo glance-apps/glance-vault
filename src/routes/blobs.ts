@@ -119,12 +119,15 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
       return;
     }
 
-    // Already stored: idempotent no-op, the client uploads nothing. Ensure this
-    // account has a metadata row for it (a re-uploader of an existing blob still
-    // expects to reference it).
-    if (blobStore.exists(body.blobHash)) {
-      const stat = blobStore.stat(body.blobHash);
-      store.insertBlobIfAbsent(body.accountId, body.blobHash, stat ? stat.size : body.size);
+    // Dedup is PER-ACCOUNT: only skip the upload when THIS account already has a
+    // metadata row for the hash. We must not key on global byte existence
+    // (blobStore.exists): the bytes are per-account ciphertext, so two accounts
+    // effectively never share a content hash, and treating a hash another account
+    // uploaded as "already stored" would let any token-holder claim and download
+    // it without possessing the bytes — a cross-account confidentiality oracle.
+    // An account that does not yet have the row uploads the bytes itself and thus
+    // proves possession, even if the identical bytes happen to be on disk.
+    if (store.getBlob(body.accountId, body.blobHash) !== null) {
       res.status(200).json({ exists: true, blobHash: body.blobHash });
       return;
     }
@@ -231,15 +234,20 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
         return;
       }
 
-      // Already stored (a prior finalize, or another upload of the same content):
-      // no-op, do not duplicate, do not error. Clean up this session.
-      if (blobStore.exists(session.blobHash)) {
-        const stat = blobStore.stat(session.blobHash);
-        const size = stat ? stat.size : session.declaredSize;
-        store.insertBlobIfAbsent(accountId, session.blobHash, size);
+      // Already stored FOR THIS ACCOUNT (a prior finalize of the same hash by the
+      // same account): no-op, do not duplicate, do not error. Clean up this
+      // session. Keyed per-account, not on global byte existence: a hash another
+      // account uploaded must not short-circuit this account's finalize, or a
+      // caller could obtain a metadata row (and thus download rights) without
+      // ever supplying the bytes. When the account lacks the row we fall through
+      // to reassemble + hash-verify below, which forces genuine possession.
+      const owned = store.getBlob(accountId, session.blobHash);
+      if (owned !== null) {
         blobStore.discardSession(session.uploadId);
         store.deleteUploadSession(session.uploadId);
-        res.status(200).json({ blobHash: session.blobHash, size, stored: true, deduped: true });
+        res
+          .status(200)
+          .json({ blobHash: session.blobHash, size: owned.size, stored: true, deduped: true });
         return;
       }
 

@@ -533,6 +533,41 @@ test("blobs are isolated between accounts", async () => {
   }
 });
 
+// 8b. CROSS-ACCOUNT CLAIM ORACLE IS CLOSED: dedup is keyed per-account, so a
+// caller who merely knows a hash another account uploaded cannot obtain a
+// metadata row (and thus download rights) without actually possessing the bytes.
+// The initiate short-circuit and the finalize short-circuit both key on this
+// account's metadata, not on global byte existence.
+test("a second account cannot claim a blob by hash without possessing the bytes", async () => {
+  const h = await startServer();
+  try {
+    const bytes = garbageBlob(3000);
+    const hash = await uploadInParts(h.base, "acct-a", bytes, 1500);
+
+    // acct-b knows the hash but does not have the bytes. Initiate must NOT report
+    // exists:true (that would let it skip upload and claim the blob); it opens a
+    // real upload session instead.
+    const init = await initiate(h.base, "acct-b", hash, bytes.length);
+    assert.equal(init.status, 201, "a non-owner gets a fresh session, not a dedup hit");
+    assert.notEqual(init.body.exists, true, "initiate does not leak another account's blob");
+    assert.equal(await headExists(h.base, "acct-b", hash), 404, "still no metadata row for acct-b");
+
+    // Finalizing WITHOUT uploading the bytes cannot succeed: the reassembled
+    // (empty) bytes do not hash to the declared address, so it is rejected rather
+    // than deduped against acct-a's on-disk bytes.
+    const fin = await finalize(h.base, "acct-b", init.body.uploadId as string);
+    assert.equal(fin.status, 400, "no possession, no claim");
+    assert.equal(await headExists(h.base, "acct-b", hash), 404, "acct-b never gained access");
+
+    // The legitimate same-account dedup still works: acct-a re-initiating the
+    // hash it truly owns is the idempotent no-op.
+    const again = await initiate(h.base, "acct-a", hash, bytes.length);
+    assert.equal(again.body.exists, true, "the owner still gets the dedup fast path");
+  } finally {
+    h.close();
+  }
+});
+
 // 9. AUTH: the blob endpoints sit behind device-token auth, like every other
 // protected route. A request without the token is rejected before any work.
 test("blob endpoints require the device token", async () => {

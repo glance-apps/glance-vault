@@ -51,6 +51,32 @@ export interface Config {
   // (and thereby keep logging off in tests); loadConfig always resolves a
   // concrete value.
   requestLog?: boolean;
+  // Express "trust proxy" setting. The server sits behind a TLS-terminating
+  // reverse proxy, so req.ip (used by rate limiting) is only correct once Express
+  // is told which hops to trust. DEFAULT "loopback": trust a proxy on localhost,
+  // matching the compose setup that binds 127.0.0.1. Accepts a preset string
+  // ("loopback"), a boolean, or a hop count. Optional in the type; loadConfig
+  // resolves a concrete value.
+  trustProxy?: string | number | boolean;
+  // Per-IP rate limiting. DEFAULT ON. A coarse abuse backstop on top of the
+  // reverse proxy. Optional in the type so test config literals may omit it
+  // (limiter off in tests unless a test opts in); loadConfig resolves a value.
+  rateLimit?: boolean;
+  // Rate-limit window in ms and the max requests per IP per window. Defaults:
+  // 60s window, 600 requests (10 rps sustained per client IP) — generous for a
+  // household behind one NAT, restrictive enough to blunt a flood.
+  rateLimitWindowMs?: number;
+  rateLimitMax?: number;
+  // Process-wide ceiling on total concurrent SSE connections across all accounts
+  // (the global backstop the per-account cap does not provide). Default 1024.
+  maxSseConnections?: number;
+  // Stale resumable-upload reaper (Phase 7). An abandoned upload leaves a session
+  // row plus staged part bytes on disk; without a reaper they accumulate. A
+  // session older than the TTL is swept (staged bytes + row removed). ALWAYS ON
+  // (unlike blob reclaim, this only ever removes transfer-layer scratch, never a
+  // finalized blob). Defaults: 24h TTL, 60min sweep interval.
+  uploadSessionTtlMs?: number;
+  uploadSessionSweepIntervalMs?: number;
 }
 
 interface FileConfig {
@@ -67,6 +93,13 @@ interface FileConfig {
   blobDeadDevicePeriodDays?: number;
   blobReclaimIntervalMinutes?: number;
   requestLog?: boolean;
+  trustProxy?: string | number | boolean;
+  rateLimit?: boolean;
+  rateLimitWindowSeconds?: number;
+  rateLimitMax?: number;
+  maxSseConnections?: number;
+  uploadSessionTtlHours?: number;
+  uploadSessionSweepMinutes?: number;
 }
 
 const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
@@ -77,6 +110,14 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_BLOB_GRACE_PERIOD_MS = 30 * DAY_MS;
 export const DEFAULT_BLOB_DEAD_DEVICE_PERIOD_MS = 90 * DAY_MS;
 export const DEFAULT_BLOB_RECLAIM_INTERVAL_MS = 60 * 60 * 1000;
+// Rate-limit defaults: 60s window, 600 requests per IP per window.
+export const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+export const DEFAULT_RATE_LIMIT_MAX = 600;
+// Process-wide SSE connection ceiling across all accounts.
+export const DEFAULT_MAX_SSE_CONNECTIONS = 1024;
+// Stale-upload-session reaper defaults: 24h TTL, 60min sweep interval.
+export const DEFAULT_UPLOAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_UPLOAD_SESSION_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 // 1 GiB. Generous for a self-hoster (video is first-class); an operator running
 // a tighter tier lowers it. This is the boundary that lets whole-blob storage
 // stay simple (no chunked content-addressing).
@@ -203,6 +244,58 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     requestLog = true;
   }
 
+  // Trust proxy. Env wins over file over the default ("loopback"). Numeric
+  // strings become a hop count; "true"/"false" become booleans; any other string
+  // (e.g. "loopback") is passed through to Express as-is.
+  const trustProxyRaw = env.GLANCEVAULT_TRUST_PROXY ?? file.trustProxy;
+  const trustProxy = normalizeTrustProxy(trustProxyRaw);
+
+  // Per-IP rate limiting. DEFAULT ON; off only on an explicit off/false/0/no.
+  const rateLimitEnv = env.GLANCEVAULT_RATE_LIMIT;
+  let rateLimit: boolean;
+  if (rateLimitEnv !== undefined) {
+    rateLimit = !["off", "false", "0", "no"].includes(rateLimitEnv.trim().toLowerCase());
+  } else if (typeof file.rateLimit === "boolean") {
+    rateLimit = file.rateLimit;
+  } else {
+    rateLimit = true;
+  }
+
+  const rateLimitWindowMs = resolveDuration(
+    env.GLANCEVAULT_RATE_LIMIT_WINDOW_SECONDS,
+    file.rateLimitWindowSeconds,
+    1000,
+    DEFAULT_RATE_LIMIT_WINDOW_MS,
+    "GLANCEVAULT_RATE_LIMIT_WINDOW_SECONDS",
+  );
+  const rateLimitMax = resolveCount(
+    env.GLANCEVAULT_RATE_LIMIT_MAX,
+    file.rateLimitMax,
+    DEFAULT_RATE_LIMIT_MAX,
+    "GLANCEVAULT_RATE_LIMIT_MAX",
+  );
+  const maxSseConnections = resolveCount(
+    env.GLANCEVAULT_MAX_SSE_CONNECTIONS,
+    file.maxSseConnections,
+    DEFAULT_MAX_SSE_CONNECTIONS,
+    "GLANCEVAULT_MAX_SSE_CONNECTIONS",
+  );
+
+  const uploadSessionTtlMs = resolveDuration(
+    env.GLANCEVAULT_UPLOAD_SESSION_TTL_HOURS,
+    file.uploadSessionTtlHours,
+    60 * 60 * 1000,
+    DEFAULT_UPLOAD_SESSION_TTL_MS,
+    "GLANCEVAULT_UPLOAD_SESSION_TTL_HOURS",
+  );
+  const uploadSessionSweepIntervalMs = resolveDuration(
+    env.GLANCEVAULT_UPLOAD_SESSION_SWEEP_MINUTES,
+    file.uploadSessionSweepMinutes,
+    60 * 1000,
+    DEFAULT_UPLOAD_SESSION_SWEEP_INTERVAL_MS,
+    "GLANCEVAULT_UPLOAD_SESSION_SWEEP_MINUTES",
+  );
+
   return {
     storagePath,
     port,
@@ -215,7 +308,49 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     blobDeadDevicePeriodMs,
     blobReclaimIntervalMs,
     requestLog,
+    trustProxy,
+    rateLimit,
+    rateLimitWindowMs,
+    rateLimitMax,
+    maxSseConnections,
+    uploadSessionTtlMs,
+    uploadSessionSweepIntervalMs,
   };
+}
+
+// Normalize a trust-proxy config value (env string or file value) into the shape
+// Express's app.set("trust proxy", ...) accepts. Defaults to "loopback".
+function normalizeTrustProxy(raw: string | number | boolean | undefined): string | number | boolean {
+  if (raw === undefined) {
+    return "loopback";
+  }
+  if (typeof raw === "boolean" || typeof raw === "number") {
+    return raw;
+  }
+  const s = raw.trim();
+  if (s.toLowerCase() === "true") return true;
+  if (s.toLowerCase() === "false") return false;
+  if (/^\d+$/.test(s)) return Number(s);
+  return s;
+}
+
+// Resolve a positive-integer count config (env string over file number over
+// default). Rejects a non-integer or non-positive value.
+function resolveCount(
+  envValue: string | undefined,
+  fileValue: number | undefined,
+  defaultValue: number,
+  envName: string,
+): number {
+  const raw = envValue ?? (fileValue != null ? String(fileValue) : undefined);
+  if (raw === undefined) {
+    return defaultValue;
+  }
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`Invalid ${envName}: ${raw}`);
+  }
+  return n;
 }
 
 // Resolve a duration config expressed in operator-friendly units (days,

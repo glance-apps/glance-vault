@@ -54,6 +54,13 @@ built-in defaults.
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
 | Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
 | Request logging | `GLANCEVAULT_REQUEST_LOG` | `requestLog` | on |
+| Trust proxy | `GLANCEVAULT_TRUST_PROXY` | `trustProxy` | `loopback` |
+| Per-IP rate limiting | `GLANCEVAULT_RATE_LIMIT` | `rateLimit` | on |
+| Rate-limit window (s) | `GLANCEVAULT_RATE_LIMIT_WINDOW_SECONDS` | `rateLimitWindowSeconds` | 60 |
+| Rate-limit max/window | `GLANCEVAULT_RATE_LIMIT_MAX` | `rateLimitMax` | 600 |
+| Max SSE connections (total) | `GLANCEVAULT_MAX_SSE_CONNECTIONS` | `maxSseConnections` | 1024 |
+| Upload-session TTL (h) | `GLANCEVAULT_UPLOAD_SESSION_TTL_HOURS` | `uploadSessionTtlHours` | 24 |
+| Upload-session sweep (min) | `GLANCEVAULT_UPLOAD_SESSION_SWEEP_MINUTES` | `uploadSessionSweepMinutes` | 60 |
 
 `GLANCEVAULT_ALLOWED_ORIGINS` is a comma-separated list of origins; the
 `allowedOrigins` config file field is an array. The environment variable wins
@@ -62,15 +69,36 @@ single `*` entry allows any origin. Preflight OPTIONS requests are answered
 before auth, so browser clients work without sending the device token on the
 preflight.
 
+Every client that connects cross-origin must be listed. That includes the
+dayGLANCE **Electron desktop** app, whose renderer sends `Origin: app://dayglance`
+— omit it and the desktop app's SSE/`fetch` is blocked by the browser engine and
+it silently degrades to polling. A typical allow list is
+`app://dayglance,https://app.example.com` (replace the second entry with your
+real production web origin(s)). See `config.example.json` / `.env.example`.
+
+**Abuse limits.** Per-IP rate limiting is on by default (a coarse backstop on top
+of the reverse proxy; default 600 requests/IP/minute, `429` with `Retry-After`
+past that). Because the server runs behind a TLS-terminating proxy, `req.ip` is
+only correct when Express is told which hop to trust: `GLANCEVAULT_TRUST_PROXY`
+defaults to `loopback` (a proxy on localhost, matching the compose setup). Set it
+to a hop count (e.g. `1`) if your topology differs. `/events` (SSE) is additionally
+bounded by a per-account cap (64) and a process-wide total cap
+(`GLANCEVAULT_MAX_SSE_CONNECTIONS`, default 1024); an over-cap connection gets a
+clean `429`.
+
 The config file path defaults to `./config.json` and can be overridden with
 `GLANCEVAULT_CONFIG`. See `config.example.json` and `.env.example`.
 
 Request logging is on by default: the server prints one concise line per
-request (method, path, status, duration), skipping the `/healthz` health check
-so it does not drown out real traffic. This is the first thing to check when a
-client "does nothing" — if no line appears when the client acts, the request
-never reached the server (see [Connecting a browser app](#connecting-a-browser-app)).
-Set `GLANCEVAULT_REQUEST_LOG=off` to silence it.
+request (method, a redacted route template, status, duration), skipping the
+`/healthz` health check so it does not drown out real traffic. The query string
+and dynamic path segments (accountId, the plaintext `entityId`, blob hashes) are
+stripped — a request to `/sync/dayglance/dailyNotes:2026-07-10?accountId=house-1`
+logs as `GET /sync/:app/:entityId` — so no per-user metadata reaches the logs.
+This is the first thing to check when a client "does nothing" — if no line
+appears when the client acts, the request never reached the server (see
+[Connecting a browser app](#connecting-a-browser-app)). Set
+`GLANCEVAULT_REQUEST_LOG=off` to silence it.
 
 ### The device token
 
@@ -173,9 +201,10 @@ vault.example.com {
 ```
 
 Then point the GLANCE apps at `https://vault.example.com`. If those apps run in a
-browser on a different origin, set `GLANCEVAULT_ALLOWED_ORIGINS` to their origins
-(for example `https://app.example.com`) so CORS permits them. The device token is
-sent in the `Authorization` header, so it rides over the proxy unchanged.
+browser or the Electron desktop app on a different origin, set
+`GLANCEVAULT_ALLOWED_ORIGINS` to their origins (for example
+`app://dayglance,https://app.example.com`) so CORS permits them. The device token
+is sent in the `Authorization` header, so it rides over the proxy unchanged.
 
 The `flush_interval -1` line is required for the real-time push endpoint to work
 through the proxy. On nginx the equivalent is `proxy_buffering off` for the
@@ -183,6 +212,14 @@ through the proxy. On nginx the equivalent is `proxy_buffering off` for the
 honors). Any reverse proxy in front of the server must disable response
 buffering for `/events`, or SSE nudges get batched and clients silently fall
 back to polling.
+
+Because per-IP rate limiting keys on the client address, the proxy must forward
+`X-Forwarded-For` and the server must trust it. `GLANCEVAULT_TRUST_PROXY` defaults
+to `loopback`, which is correct when the proxy runs on the same host and connects
+over localhost (the compose default). Caddy and nginx both set
+`X-Forwarded-For` automatically; if you front the server with additional hops,
+set `GLANCEVAULT_TRUST_PROXY` to the number of trusted proxies so a client cannot
+spoof its address and evade the limit.
 
 ### Connecting a browser app
 
@@ -194,6 +231,9 @@ nothing" with no obvious error. Two things to get right:
   allow-listed, or the browser blocks the request before the app sees a
   response. Set `GLANCEVAULT_ALLOWED_ORIGINS` to the app's origin (for example
   `https://app.example.com`). With it unset, no cross-origin request is allowed.
+  The Electron desktop app counts here too: its renderer's origin is
+  `app://dayglance`, so include it in the list or the desktop app's real-time
+  push (and every `fetch`) is blocked and it falls back to polling.
 - **No mixed content.** A page loaded over `https://` cannot call a vault at
   `http://…`; the browser blocks the insecure request silently. Serve the vault
   over HTTPS (see [Behind Caddy](#behind-caddy)) and enter its `https://` URL in
@@ -231,7 +271,7 @@ on the wire and stored as a BLOB the server never parses.
 | POST | `/sync/:app/device` | Report a device's sync cursor (forward only) |
 | GET | `/sync/:app/list` | Incremental fetch of rows with `seq > since` |
 | GET | `/sync/:app/:entityId` | Fetch a single row, or 404 |
-| DELETE | `/sync/:app/:entityId` | Soft-delete a row (sets a tombstone, advances seq) |
+| DELETE | `/sync/:app/:entityId` | Soft-delete a row (sets a tombstone, advances seq); optional `deletedAt` query param |
 
 The device cursor (`POST /sync/:app/device`, body `{ accountId, deviceId,
 lastSeenSeq }`) records how far a device has synced, advancing `last_seen_seq`
@@ -252,6 +292,13 @@ passing the highest `seq` they have seen as `since`. `list` accepts `limit`
 (default 500, max 1000) and returns `hasMore: true` when rows remain past the
 returned page.
 
+A soft-delete (`DELETE /sync/:app/:entityId`) accepts an optional `deletedAt`
+query param (epoch milliseconds). When present it is stored and returned on the
+row (as `deletedAt`) so clients can apply tombstone last-writer-wins; when
+omitted it is stored as `null`, which clients read as delete-wins. The server
+only stores and echoes this value — it never orders or merges on it (ordering
+stays purely by `seq`). Live rows always carry `deletedAt: null`.
+
 ### Hit the batch endpoint with curl
 
 ```
@@ -271,8 +318,8 @@ curl -s -X POST http://localhost:8080/sync/dayglance/batch \
 curl -s "http://localhost:8080/sync/dayglance/list?accountId=house-1&since=0" \
   -H "Authorization: Bearer $TOKEN"
 
-# Soft-delete a row.
-curl -s -X DELETE "http://localhost:8080/sync/dayglance/task-1?accountId=house-1" \
+# Soft-delete a row. Pass an optional deletedAt (epoch ms) for tombstone LWW.
+curl -s -X DELETE "http://localhost:8080/sync/dayglance/task-1?accountId=house-1&deletedAt=1752000000000" \
   -H "Authorization: Bearer $TOKEN"
 # -> {"seq":3}
 ```

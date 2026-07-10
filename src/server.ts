@@ -6,13 +6,20 @@ import { DiskBlobStore } from "./storage/disk-blobstore.js";
 import { deviceTokenAuth } from "./middleware/auth.js";
 import { cors } from "./middleware/cors.js";
 import { requestLog } from "./middleware/request-log.js";
+import { rateLimit } from "./middleware/rate-limit.js";
 import { healthRouter } from "./routes/health.js";
 import { syncRouter } from "./routes/sync.js";
 import { intentsRouter } from "./routes/intents.js";
 import { saltRouter } from "./routes/salt.js";
 import { blobsRouter } from "./routes/blobs.js";
 import { eventsRouter } from "./routes/events.js";
-import { InProcessAccountHub, type AccountHub, type Emit } from "./realtime/hub.js";
+import {
+  InProcessAccountHub,
+  DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT,
+  type AccountHub,
+  type Emit,
+} from "./realtime/hub.js";
+import { DEFAULT_MAX_SSE_CONNECTIONS } from "./config.js";
 
 // Build the Express app. Kept separate from the listen() call in index.ts so it
 // can be constructed in tests without binding a port.
@@ -35,9 +42,27 @@ export function buildApp(
   config: Config,
   store: Store,
   blobStore?: BlobStore,
-  hub: AccountHub = new InProcessAccountHub(),
+  hub?: AccountHub,
 ): Express {
   const app = express();
+
+  // Trust the reverse proxy so req.ip reflects the real client (via
+  // X-Forwarded-For), which per-IP rate limiting depends on. Default "loopback"
+  // trusts a proxy on localhost, matching the compose setup. When omitted from a
+  // test config literal, fall back to the same default rather than leaving
+  // Express's default (which would attribute every request to the proxy).
+  app.set("trust proxy", config.trustProxy ?? "loopback");
+
+  // The real-time push registry. When a caller does not inject one (index.ts,
+  // most tests), build the in-process hub with the configured global connection
+  // ceiling so a single process cannot accumulate unbounded SSE connections
+  // across accounts.
+  const accountHub =
+    hub ??
+    new InProcessAccountHub(
+      DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT,
+      config.maxSseConnections ?? DEFAULT_MAX_SSE_CONNECTIONS,
+    );
 
   // Request logging runs first so it captures every request, including a CORS
   // preflight (answered by the cors middleware) and an auth rejection. Enabled
@@ -49,6 +74,20 @@ export function buildApp(
 
   app.use(cors(config.allowedOrigins));
 
+  // Per-IP rate limiting runs after CORS (so a preflight OPTIONS, answered by the
+  // cors middleware, is never counted) and before auth (so a token-guessing
+  // flood is throttled before it reaches the constant-time compare). Off only
+  // when explicitly disabled; test config literals omit the flag, so it stays off
+  // in tests unless a test opts in.
+  if (config.rateLimit) {
+    app.use(
+      rateLimit({
+        windowMs: config.rateLimitWindowMs ?? 60_000,
+        max: config.rateLimitMax ?? 600,
+      }),
+    );
+  }
+
   app.use(healthRouter(store));
 
   app.use(deviceTokenAuth(config.deviceToken));
@@ -56,7 +95,7 @@ export function buildApp(
   // The best-effort emission hook wired to the hub. Passed to the write routers
   // so they nudge connected clients after a commit. hub.publish is non-throwing
   // and non-blocking by contract, so a push failure can never affect a write.
-  const emit: Emit = (accountId, nudge) => hub.publish(accountId, nudge);
+  const emit: Emit = (accountId, nudge) => accountHub.publish(accountId, nudge);
 
   // Protected routes. Phase 1 adds the sync transport; the salt store is a
   // Phase 3 prerequisite; intents are the cross-app transport; Phase 7 adds the
@@ -72,7 +111,7 @@ export function buildApp(
   // Real-time push (nudge-only SSE), authenticated and account-scoped exactly
   // like the routes above. See routes/events.ts for the event shape and the
   // reverse-proxy flush requirement.
-  app.use("/events", eventsRouter(store, hub));
+  app.use("/events", eventsRouter(store, accountHub));
 
   return app;
 }
