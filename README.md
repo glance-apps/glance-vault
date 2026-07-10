@@ -90,11 +90,15 @@ The config file path defaults to `./config.json` and can be overridden with
 `GLANCEVAULT_CONFIG`. See `config.example.json` and `.env.example`.
 
 Request logging is on by default: the server prints one concise line per
-request (method, path, status, duration), skipping the `/healthz` health check
-so it does not drown out real traffic. This is the first thing to check when a
-client "does nothing" — if no line appears when the client acts, the request
-never reached the server (see [Connecting a browser app](#connecting-a-browser-app)).
-Set `GLANCEVAULT_REQUEST_LOG=off` to silence it.
+request (method, a redacted route template, status, duration), skipping the
+`/healthz` health check so it does not drown out real traffic. The query string
+and dynamic path segments (accountId, the plaintext `entityId`, blob hashes) are
+stripped — a request to `/sync/dayglance/dailyNotes:2026-07-10?accountId=house-1`
+logs as `GET /sync/:app/:entityId` — so no per-user metadata reaches the logs.
+This is the first thing to check when a client "does nothing" — if no line
+appears when the client acts, the request never reached the server (see
+[Connecting a browser app](#connecting-a-browser-app)). Set
+`GLANCEVAULT_REQUEST_LOG=off` to silence it.
 
 ### The device token
 
@@ -267,7 +271,7 @@ on the wire and stored as a BLOB the server never parses.
 | POST | `/sync/:app/device` | Report a device's sync cursor (forward only) |
 | GET | `/sync/:app/list` | Incremental fetch of rows with `seq > since` |
 | GET | `/sync/:app/:entityId` | Fetch a single row, or 404 |
-| DELETE | `/sync/:app/:entityId` | Soft-delete a row (sets a tombstone, advances seq) |
+| DELETE | `/sync/:app/:entityId` | Soft-delete a row (sets a tombstone, advances seq); optional `deletedAt` query param |
 
 The device cursor (`POST /sync/:app/device`, body `{ accountId, deviceId,
 lastSeenSeq }`) records how far a device has synced, advancing `last_seen_seq`
@@ -288,6 +292,13 @@ passing the highest `seq` they have seen as `since`. `list` accepts `limit`
 (default 500, max 1000) and returns `hasMore: true` when rows remain past the
 returned page.
 
+A soft-delete (`DELETE /sync/:app/:entityId`) accepts an optional `deletedAt`
+query param (epoch milliseconds). When present it is stored and returned on the
+row (as `deletedAt`) so clients can apply tombstone last-writer-wins; when
+omitted it is stored as `null`, which clients read as delete-wins. The server
+only stores and echoes this value — it never orders or merges on it (ordering
+stays purely by `seq`). Live rows always carry `deletedAt: null`.
+
 ### Hit the batch endpoint with curl
 
 ```
@@ -307,8 +318,8 @@ curl -s -X POST http://localhost:8080/sync/dayglance/batch \
 curl -s "http://localhost:8080/sync/dayglance/list?accountId=house-1&since=0" \
   -H "Authorization: Bearer $TOKEN"
 
-# Soft-delete a row.
-curl -s -X DELETE "http://localhost:8080/sync/dayglance/task-1?accountId=house-1" \
+# Soft-delete a row. Pass an optional deletedAt (epoch ms) for tombstone LWW.
+curl -s -X DELETE "http://localhost:8080/sync/dayglance/task-1?accountId=house-1&deletedAt=1752000000000" \
   -H "Authorization: Bearer $TOKEN"
 # -> {"seq":3}
 ```
