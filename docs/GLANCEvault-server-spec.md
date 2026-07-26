@@ -160,10 +160,20 @@ almost by definition, so the no-hardware serverless user was always more
 adjacent than core. Second, serverless cannot do push (short-lived functions
 do not hold persistent connections), so it would be a polling-only tier
 needing its own parity story. The same tier-agnostic abstractions that would
-enable a serverless deploy also enable a future paid hosted Postgres product,
+enable a serverless deploy also enable a paid hosted Postgres product,
 so keeping them costs nothing and preserves both options. The Vercel deploy
-guide is not written for now; if a paid product or a serverless guide is ever
-justified, the architecture already supports it.
+guide is not written for now; if a serverless guide is ever justified, the
+architecture already supports it.
+
+Hosted tier, engine decided: if the paid hosted product proceeds, it runs
+**Postgres, self-managed, on the same box as the server**, while SQLite
+remains the default and documented path for self-hosters. Postgres is chosen
+for row-level security as a database-enforced isolation backstop under
+multi-tenant auth. Note the `seq` divergence in 5.4: Postgres needs a
+sequence or `SELECT ... FOR UPDATE` on the per-account counter, and both
+engines need test coverage so behavior does not diverge between self-host and
+hosted. Whether the hosted product proceeds at all is an open decision
+tracked in the GLANCEvault Pro Prerequisites and Build Notes document.
 
 ### 3.3 Transport interface (already defined)
 
@@ -1210,24 +1220,24 @@ and family timelines in lifeGLANCE, shared household state in lastGLANCE,
 aggregated team-progress sharing in goalGLANCE, share-token collaboration across
 the suite, and lifeGLANCE Studio hosted-export "your export is ready"
 notifications. All of these are "someone writes via HTTP, others are nudged to
-sync" — SSE.
+sync": SSE.
 
 WebSocket becomes the right tool only for TRUE bidirectional real-time, which in
 this suite would most naturally appear as:
-- Live presence ("who is active / here / doing this right now") — most natural
+- Live presence ("who is active / here / doing this right now"), most natural
   in lastGLANCE (household: who is doing which chore now) and goalGLANCE (team:
   who is active during a check-in). Presence is continuous bidirectional status,
   which SSE-plus-HTTP-heartbeat only approximates awkwardly. This is the single
   most WebSocket-native pattern in the suite.
-- Live co-editing with cursors/positions — simultaneous editing of a shared
+- Live co-editing with cursors/positions, meaning simultaneous editing of a shared
   artifact seeing each other live (Figma/Docs style): possible if dayGLANCE
   shared calendars, lifeGLANCE Studio collaborative memorial/wedding projects,
   or goalGLANCE team boards ever grow into live co-editing rather than
   async state-sharing.
-- Live team sessions in goalGLANCE — everyone in a shared live view during a
+- Live team sessions in goalGLANCE, everyone in a shared live view during a
   standup, with real-time presence and reactions.
 - Sub-second claim/lock races (e.g. lastGLANCE "I've got the trash" claimed
-  instantly so two people don't collide) — borderline; SSE-solvable but a case
+  instantly so two people don't collide), borderline; SSE-solvable but a case
   where WebSocket's bidirectionality is cleaner.
 
 None of these are near-term (Phase 9 is sync-push only; collaboration is later).
@@ -1245,7 +1255,7 @@ the SSE push, not in place of it. So SSE now is not a limitation.
   guarantee. A device that is connected drains on nudge; a disconnected device
   (backgrounded, mobile, network drop) falls back to polling and catches up on
   reconnect. Nothing is delivered only by push, so if push breaks, delivery
-  degrades to today's working polling — the correctness backstop is untouched.
+  degrades to today's working polling; the correctness backstop is untouched.
 - SERVER-SIDE: an in-process pub/sub keyed by account_id maps to that account's
   connected SSE connections; a write (new seq, or a landed intent) emits a nudge
   to the account's connections. Single-container in-memory pub/sub is simple;
@@ -1256,23 +1266,27 @@ the SSE push, not in place of it. So SSE now is not a limitation.
   all three apps, covering BOTH sync and intents.
 - BUILD SEQUENCE: server-side SSE emission first (hold connections, emit nudges
   on writes, proven in isolation), then one app consumes it end to end
-  (nudge to sync/drain), then roll to the other two — the same server-first,
+  (nudge to sync/drain), then roll to the other two, the same server-first,
   one-app-slice, then-propagate discipline used for the blob store and the
   cutovers.
 
 ## 13. Deferred / Out of Scope (recorded so it is not lost)
 
-- Paid hosted product: billing, sign-up, multi-tenant separation of untrusted
-  users. The hosted version would scope multiple households via `account_id`,
-  each still internally trusted. Gated on the apps earning enough to justify
-  the build and operating cost; not a near-term decision. Note: a paid tier
-  run on the SAME always-on container architecture preserves real-time push
-  for free (it is the identical server plus an operations and billing layer).
-  The push capability is free; push at multi-tenant scale (many persistent
+- Paid hosted product: **no longer deferred.** Prerequisites, blockers, and
+  open decisions are tracked in the separate GLANCEvault Pro Prerequisites and
+  Build Notes document. Retained here for context: the hosted version scopes
+  multiple households via `account_id`, each still internally trusted, and the
+  shared-schema tenancy model is settled (see that document). A paid tier run
+  on the SAME always-on container architecture preserves real-time push for
+  free (it is the identical server plus an operations and billing layer). The
+  push capability is free; push at multi-tenant scale (many persistent
   connections, horizontal scaling of stateful connections) is the part that
-  takes real engineering, and it defers with the rest of the paid product.
+  takes real engineering, and launch shape is single-replica as a result.
 - Real authentication system: multi-tenant registration and credential
-  storage. Near-term, device-to-server auth for a single-user self-hosted
-  instance is a config-file token, not a system.
+  storage. **Superseded for the hosted product** by item 1 (per-account
+  credential binding) and item 6 (key-to-account indirection) in the Pro
+  prerequisites document. Still accurate for self-host: device-to-server auth
+  for a single-user self-hosted instance is a config-file token, not a system,
+  and that model must keep working after Pro ships.
 - Tier downgrade (backend to file tier) with existing media: an edge case,
   since media cannot exist on the file tier. Out of scope for now.
