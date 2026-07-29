@@ -136,6 +136,24 @@ export interface UploadPartRecord {
   receivedAt: string;
 }
 
+// A per-device credential bound to one account. STORAGE ONLY at this phase:
+// nothing constructs, reads, or validates one of these yet, and the Store
+// interface below deliberately exposes no methods for them — the issuing phase
+// adds those alongside the code that uses them.
+//
+// IDENTITY CONSTRAINT: accountId is the stable internal identity; a credential
+// MAPS TO one and is never itself the account identity. credentialId is an
+// opaque handle for the credential record, credentialHash is the verifier for
+// the secret (the secret itself is never stored), and neither may be used
+// anywhere as an account key.
+export interface CredentialRecord {
+  credentialId: string;
+  accountId: string;
+  deviceId: string;
+  credentialHash: string;
+  createdAt: string;
+}
+
 // Thin storage interface. Request handlers depend only on this interface, never
 // on a concrete database. SQLite is the only implementation in Phase 0; a
 // Postgres implementation can be added later by satisfying this same contract

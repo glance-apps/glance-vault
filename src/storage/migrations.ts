@@ -8,7 +8,9 @@ import type Database from "better-sqlite3";
 // sequence counter; version 2 adds the per-account key-derivation salt; version
 // 3 adds the Phase 7 content-addressed blob store (metadata + reference
 // tracking + resumable upload sessions); version 4 adds the nullable
-// sync_rows.deleted_at tombstone timestamp used for client-side tombstone LWW.
+// sync_rows.deleted_at tombstone timestamp used for client-side tombstone LWW;
+// version 5 adds the per-device credential store, which is STORAGE ONLY at this
+// phase — nothing reads or writes it yet.
 //
 // envelope is an opaque BLOB. The server stores and returns these bytes intact
 // and never parses them.
@@ -158,6 +160,71 @@ const MIGRATIONS: Migration[] = [
       -- concurrent edit. The server only stores and returns it; it never orders
       -- or merges on it (ordering stays purely by seq).
       ALTER TABLE sync_rows ADD COLUMN deleted_at INTEGER;
+    `,
+  },
+  {
+    version: 5,
+    sql: `
+      -- Per-device credentials, each bound to exactly one account. STORAGE ONLY
+      -- at this phase: no code issues, reads, or validates a row here, and no
+      -- request handler consults this table. It exists so issuance (a later
+      -- phase) and server-side account derivation (the phase after that) are
+      -- additions rather than migrations.
+      --
+      -- IDENTITY CONSTRAINT — the reason this table is shaped the way it is:
+      -- account_id is the stable internal identity, and a credential only ever
+      -- MAPS TO one. A credential value is NEVER the account identity. That is
+      -- why the account scope is its own column rather than something derived
+      -- from, or equal to, the credential: a second thing that maps to the same
+      -- account_id (a purchased license key, later) is then one more row shape
+      -- pointing at an identity that already exists, not a re-keying of every
+      -- account-scoped table. Nothing downstream may treat credential_id or
+      -- credential_hash as an account key.
+      --
+      --   credential_id    opaque server-generated identifier for the credential
+      --                    record itself. An internal handle for referring to one
+      --                    credential (revocation, later); NOT the secret and NOT
+      --                    an account identity.
+      --   account_id       the account this credential grants access to. Same
+      --                    identity space as sync_rows/intent_events/devices.
+      --   device_id        the client-generated device identifier, same space as
+      --                    devices.device_id. Deliberately NOT a foreign key —
+      --                    see the note below.
+      --   credential_hash  the verifier: a hash of the credential secret. The
+      --                    secret itself is never stored, so a database read
+      --                    does not yield usable credentials. Opaque string, so
+      --                    the hash construction is the issuing phase's choice
+      --                    and is not frozen here.
+      --   created_at       ISO timestamp.
+      --
+      -- NO FOREIGN KEY to devices(account_id, device_id), deliberately. This
+      -- connection runs with PRAGMA foreign_keys = ON, so an FK here would be
+      -- enforced behavior, not documentation: it would make issuing a credential
+      -- require a pre-existing devices row. devices rows are the tombstone-GC
+      -- cursors, created only when a device reports a sync cursor, so an FK would
+      -- couple credential issuance to GC state and force a device to sync before
+      -- it could enroll. The columns carry the association; no constraint links
+      -- the tables.
+      --
+      -- Revocation state is deliberately absent (a later phase owns it).
+      CREATE TABLE device_credentials (
+        credential_id   TEXT NOT NULL PRIMARY KEY,
+        account_id      TEXT NOT NULL,
+        device_id       TEXT NOT NULL,
+        credential_hash TEXT NOT NULL,
+        created_at      TEXT NOT NULL
+      );
+
+      -- Lookup by presented credential. UNIQUE because a verifier must resolve
+      -- to at most one credential; an ambiguous match would be an authentication
+      -- bug, so the database refuses to store one.
+      CREATE UNIQUE INDEX idx_credentials_hash ON device_credentials (credential_hash);
+
+      -- Lookup of an account's credentials (a household has several devices) and
+      -- of a specific device's. NOT unique: whether one device may hold more
+      -- than one credential at a time is an issuance-policy question the issuing
+      -- phase decides, and a unique constraint here would decide it early.
+      CREATE INDEX idx_credentials_account ON device_credentials (account_id, device_id);
     `,
   },
 ];
