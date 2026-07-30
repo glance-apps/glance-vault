@@ -145,7 +145,7 @@ test("reclaim off (retain default) deletes nothing", async () => {
     assert.equal(result.enabled, false, "the sweep reports it did not run");
     assert.deepEqual(result.reclaimed, [], "nothing was reclaimed");
     assert.equal(await headExists(h.base, account, hash), 200, "the blob is retained");
-    assert.ok(h.store.getBlob(account, hash), "the row is retained");
+    assert.ok(h.store.forAccount(account).getBlob(hash), "the row is retained");
     assert.ok(h.blobStore.exists(hash), "the bytes are retained");
   } finally {
     h.close();
@@ -196,11 +196,11 @@ test("an unacked non-dead device blocks reclaim", async () => {
   try {
     const account = "acct-unacked";
     const hash = await uploadBlob(h.base, account, garbageBlob());
-    const rec = h.store.getBlob(account, hash);
+    const rec = h.store.forAccount(account).getBlob(hash);
     assert.ok(rec?.zeroRefSeq != null);
 
     // A device that is behind the zero point (last_seen_seq 0 < zero_ref_seq).
-    h.store.updateDeviceCursor(account, "dev-behind", 0);
+    h.store.forAccount(account).updateDeviceCursor("dev-behind", 0);
 
     // 40 days on: grace (30d) elapsed, but the device is non-dead (< 90d) and
     // behind the zero point, so it blocks.
@@ -223,7 +223,7 @@ test("a dead device is excluded so reclaim can proceed", async () => {
     const hash = await uploadBlob(h.base, account, garbageBlob());
 
     // Same behind-the-zero-point device as the previous test...
-    h.store.updateDeviceCursor(account, "dev-behind", 0);
+    h.store.forAccount(account).updateDeviceCursor("dev-behind", 0);
 
     // ...but now 100 days on: the device (last active ~ real now) is past the
     // 90-day dead threshold, so it is excluded; grace (30d) has elapsed; zero
@@ -233,7 +233,7 @@ test("a dead device is excluded so reclaim can proceed", async () => {
     assert.equal(result.reclaimed.length, 1, "the dead device does not block reclaim");
     assert.equal(result.reclaimed[0].blobHash, hash);
     assert.equal(await headExists(h.base, account, hash), 404, "bytes + row deleted");
-    assert.equal(h.store.getBlob(account, hash), null);
+    assert.equal(h.store.forAccount(account).getBlob(hash), null);
     assert.equal(h.blobStore.exists(hash), false);
   } finally {
     h.close();
@@ -249,11 +249,11 @@ test("a blob re-referenced after hitting zero is not reclaimed", async () => {
     const hash = await uploadBlob(h.base, account, garbageBlob());
     assert.equal(await refAdd(h.base, account, hash), 1); // 0 -> 1
     assert.equal(await refRelease(h.base, account, hash), 0); // 1 -> 0, zero point stamped
-    const atZero = h.store.getBlob(account, hash);
+    const atZero = h.store.forAccount(account).getBlob(hash);
     assert.notEqual(atZero?.zeroRefSeq, null, "zero point recorded at zero");
 
     assert.equal(await refAdd(h.base, account, hash), 1); // 0 -> 1 again
-    const revived = h.store.getBlob(account, hash);
+    const revived = h.store.forAccount(account).getBlob(hash);
     assert.equal(revived?.refCount, 1);
     assert.equal(revived?.zeroRefSeq, null, "zero point cleared on re-reference");
 
@@ -277,12 +277,12 @@ test("an eligible blob is reclaimed (bytes + row), idempotently, and can be re-u
     const account = "acct-eligible";
     const bytes = garbageBlob(2048);
     const hash = await uploadBlob(h.base, account, bytes);
-    const rec = h.store.getBlob(account, hash);
+    const rec = h.store.forAccount(account).getBlob(hash);
     assert.ok(rec?.zeroRefSeq != null);
 
     // A device that HAS acked past the zero point (last_seen_seq >= zero_ref_seq):
     // condition c is satisfied even though the device is alive.
-    h.store.updateDeviceCursor(account, "dev-acked", rec.zeroRefSeq);
+    h.store.forAccount(account).updateDeviceCursor("dev-acked", rec.zeroRefSeq);
 
     // 40 days on: grace elapsed, device non-dead but acked, zero references.
     const later = new Date(Date.now() + 40 * DAY);
@@ -292,7 +292,7 @@ test("an eligible blob is reclaimed (bytes + row), idempotently, and can be re-u
     assert.equal(result.reclaimed.length, 1, "the eligible blob was reclaimed");
     assert.equal(result.reclaimed[0].blobHash, hash);
     assert.equal(result.reclaimed[0].size, bytes.length);
-    assert.equal(h.store.getBlob(account, hash), null, "the row is gone");
+    assert.equal(h.store.forAccount(account).getBlob(hash), null, "the row is gone");
     assert.equal(h.blobStore.exists(hash), false, "the bytes are gone");
     assert.equal(await headExists(h.base, account, hash), 404);
 
@@ -325,10 +325,10 @@ test("reclaim eligibility is evaluated per account and across all devices", asyn
     // Account A: two devices, one acked past the zero point, one still behind.
     const account = "acct-multi";
     const hash = await uploadBlob(h.base, account, garbageBlob());
-    const rec = h.store.getBlob(account, hash);
+    const rec = h.store.forAccount(account).getBlob(hash);
     assert.ok(rec?.zeroRefSeq != null);
-    h.store.updateDeviceCursor(account, "dev-acked", rec.zeroRefSeq);
-    h.store.updateDeviceCursor(account, "dev-behind", 0);
+    h.store.forAccount(account).updateDeviceCursor("dev-acked", rec.zeroRefSeq);
+    h.store.forAccount(account).updateDeviceCursor("dev-behind", 0);
 
     const later = new Date(Date.now() + 40 * DAY);
     let result = reclaimSweep(h.store, h.blobStore, onPolicy(), later, QUIET);
@@ -336,10 +336,10 @@ test("reclaim eligibility is evaluated per account and across all devices", asyn
     assert.equal(await headExists(h.base, account, hash), 200);
 
     // Once the lagging device catches up, the blob becomes eligible.
-    h.store.updateDeviceCursor(account, "dev-behind", rec.zeroRefSeq);
+    h.store.forAccount(account).updateDeviceCursor("dev-behind", rec.zeroRefSeq);
     result = reclaimSweep(h.store, h.blobStore, onPolicy(), later, QUIET);
     assert.equal(result.reclaimed.length, 1, "all devices acked → eligible");
-    assert.equal(h.store.getBlob(account, hash), null);
+    assert.equal(h.store.forAccount(account).getBlob(hash), null);
   } finally {
     h.close();
   }

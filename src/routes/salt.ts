@@ -1,5 +1,5 @@
 import { Router, json, type Request, type Response } from "express";
-import type { Store } from "../storage/types.js";
+import type { ScopeResolver } from "../scope.js";
 
 // Phase 3 prerequisite: the key-derivation salt as server state. One salt per
 // account, fetched by any new device so it can derive the same root key from the
@@ -7,7 +7,10 @@ import type { Store } from "../storage/types.js";
 // and returned as a base64 string and never decoded. The server stores no
 // passphrase, no derived key, and performs no key derivation. These endpoints
 // sit behind device-token auth (mounted after the auth middleware in server.ts).
-export function saltRouter(store: Store): Router {
+// The account scope arrives as a PATH PARAM here (the third transport, next to
+// sync/intents/blobs bodies and query strings); it is resolved to an
+// account-bound handle exactly like every other router (Phase 1.3a).
+export function saltRouter(resolve: ScopeResolver): Router {
   const router = Router();
 
   // Require a non-empty accountId on every route that carries it.
@@ -21,7 +24,7 @@ export function saltRouter(store: Store): Router {
 
   // Return the salt for this account, or 404 if none is stored yet.
   router.get("/:accountId", (req: Request, res: Response) => {
-    const record = store.getSalt(req.params.accountId);
+    const record = resolve(req, req.params.accountId).getSalt();
     if (record === null) {
       res.status(404).json({ error: "not found" });
       return;
@@ -39,7 +42,7 @@ export function saltRouter(store: Store): Router {
       res.status(400).json({ error: "salt must be a non-empty base64 string" });
       return;
     }
-    const result = store.putSaltIfAbsent(req.params.accountId, body.salt);
+    const result = resolve(req, req.params.accountId).putSaltIfAbsent(body.salt);
     res.status(200).json(result);
   });
 

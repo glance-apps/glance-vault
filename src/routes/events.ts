@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
-import type { Store } from "../storage/types.js";
 import type { AccountHub, Nudge, Subscriber } from "../realtime/hub.js";
+import type { ScopeResolver } from "../scope.js";
 
 // Real-time push endpoint (Phase 9, spec §14). A single authenticated,
 // account-scoped SSE stream. It is mounted after the device-token auth
@@ -61,7 +61,7 @@ export interface EventsOptions {
   heartbeatMs?: number;
 }
 
-export function eventsRouter(store: Store, hub: AccountHub, opts: EventsOptions = {}): Router {
+export function eventsRouter(resolve: ScopeResolver, hub: AccountHub, opts: EventsOptions = {}): Router {
   const router = Router();
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   let nextId = 1;
@@ -72,6 +72,11 @@ export function eventsRouter(store: Store, hub: AccountHub, opts: EventsOptions 
       res.status(400).json({ error: "accountId is required" });
       return;
     }
+    // Resolve the scope once, at connect: this is the lifetime dimension SSE
+    // adds — the account bound here is the account this stream serves until it
+    // closes. resolve() is pure construction, so placing it here (before the
+    // cap check) changes no observable ordering.
+    const scoped = resolve(req, accountId);
 
     const sub: Subscriber = {
       id: nextId++,
@@ -106,7 +111,7 @@ export function eventsRouter(store: Store, hub: AccountHub, opts: EventsOptions 
     // Initial reconcile event: the account's current latest seq. A client can
     // compare this to its cursor and drain immediately, without waiting for the
     // next write to fire an activity nudge.
-    res.write(frame("ready", { seq: store.latestSeq(accountId) }));
+    res.write(frame("ready", { seq: scoped.latestSeq() }));
 
     // Teardown on disconnect/close/error: stop the heartbeat and remove the
     // subscription so a dead connection never leaks in the hub. Idempotent.

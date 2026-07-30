@@ -1,6 +1,7 @@
 import { Router, json, type Request, type Response } from "express";
-import type { Store, IntentEventInput, IntentEventRecord } from "../storage/types.js";
+import type { IntentEventInput, IntentEventRecord } from "../storage/types.js";
 import type { Emit } from "../realtime/hub.js";
+import type { ScopeResolver } from "../scope.js";
 
 const DEFAULT_LIMIT = 500;
 const MAX_LIMIT = 1000;
@@ -51,7 +52,9 @@ function normalizeExpiresAt(value: unknown): string | null {
 // exactly like sync. The server never decrypts the envelope, assigns a
 // monotonic seq per account (the same source sync uses), and never tracks a
 // per-client receive cursor: the client owns its receive cursor and lists since
-// a value it supplies. Intents carry no app path param: they are the cross-app
+// a value it supplies. Like the sync router, this receives a ScopeResolver
+// (Phase 1.3a): the claimed accountId is extracted exactly as before and
+// resolved to an account-bound handle, with no other path to account data. Intents carry no app path param: they are the cross-app
 // channel between the apps, so they are account scoped only.
 // emit is the best-effort real-time push hook (Phase 9), same contract as the
 // sync router: after a landed intent advances the account seq, nudge connected
@@ -59,7 +62,7 @@ function normalizeExpiresAt(value: unknown): string | null {
 // source as sync, so this is the same "activity" nudge — a nudged client drains
 // both sync and intents. Post-commit, non-throwing, non-blocking; never gates
 // the write.
-export function intentsRouter(store: Store, emit: Emit): Router {
+export function intentsRouter(resolve: ScopeResolver, emit: Emit): Router {
   const router = Router();
 
   // Insert a batch of intent events. Body: { accountId, events: [{ eventId,
@@ -108,7 +111,7 @@ export function intentsRouter(store: Store, emit: Emit): Router {
       });
     }
 
-    const result = store.insertIntents(body.accountId, events);
+    const result = resolve(req, body.accountId).insertIntents(events);
     // A landed intent is always CONTENT — an insert-only cross-device message
     // another device must pull — never bookkeeping, so it nudges unconditionally
     // (there is no notify opt-out here, unlike the sync batch path). Emit only
@@ -151,7 +154,7 @@ export function intentsRouter(store: Store, emit: Emit): Router {
       }
     }
 
-    const result = store.listIntents(accountId, since, limit);
+    const result = resolve(req, accountId).listIntents(since, limit);
     res.status(200).json({
       rows: result.rows.map(serializeIntent),
       hasMore: result.hasMore,

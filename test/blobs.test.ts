@@ -209,7 +209,7 @@ test("re-uploading a known hash is an idempotent no-op", async () => {
     assert.equal(again.body.uploadId, undefined, "no new session is created for a known hash");
 
     // The bytes are unchanged and there is exactly one metadata row.
-    const rec = h.store.getBlob(account, hash);
+    const rec = h.store.forAccount(account).getBlob(hash);
     assert.ok(rec, "the metadata row exists");
     assert.equal(rec.size, bytes.length);
 
@@ -330,7 +330,7 @@ test("finalize rejects when the reassembled bytes do not match the declared hash
 
     // Nothing was stored under the declared hash.
     assert.equal(await headExists(h.base, account, declaredHashValue), 404, "the blob was not stored");
-    assert.equal(h.store.getBlob(account, declaredHashValue), null, "no metadata row was created");
+    assert.equal(h.store.forAccount(account).getBlob(declaredHashValue), null, "no metadata row was created");
   } finally {
     h.close();
   }
@@ -437,7 +437,7 @@ test("reference add/release maintains the count and records the zero point", asy
 
     // A freshly uploaded blob is at zero references with a zero point already
     // stamped (it is at zero from creation until something references it).
-    const fresh = h.store.getBlob(account, hash);
+    const fresh = h.store.forAccount(account).getBlob(hash);
     assert.ok(fresh);
     assert.equal(fresh.refCount, 0, "starts at zero references");
     assert.notEqual(fresh.zeroRefSeq, null, "a zero point is recorded at creation");

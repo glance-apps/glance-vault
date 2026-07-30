@@ -27,7 +27,7 @@ for (let b = 0; b < batches; b++) {
       deleted: false,
     });
   }
-  store.batchUpsert(app, accountId, rows);
+  store.forAccount(accountId).batchUpsert(app, rows);
 }
 store.close();
 

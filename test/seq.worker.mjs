@@ -17,7 +17,7 @@ const { storagePath, accountId, iterations } = workerData;
 const store = new SqliteStore(storagePath);
 const assigned = [];
 for (let i = 0; i < iterations; i++) {
-  assigned.push(store.nextSeq(accountId));
+  assigned.push(store.forAccount(accountId).nextSeq());
 }
 store.close();
 

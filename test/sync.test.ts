@@ -154,7 +154,7 @@ test("seq stays monotonic under concurrent batch writes", async () => {
     const seqs: number[] = [];
     let cursor = 0;
     for (;;) {
-      const page = reader.listRows(APP, ACCOUNT, cursor, 1000);
+      const page = reader.forAccount(ACCOUNT).listRows(APP, cursor, 1000);
       for (const row of page.rows) {
         seqs.push(row.seq);
       }

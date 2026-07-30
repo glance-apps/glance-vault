@@ -1,7 +1,6 @@
 import { Router, json, raw, type Request, type Response } from "express";
 import { createHash, randomUUID } from "node:crypto";
-import type { Store } from "../storage/types.js";
-import type { BlobStore } from "../storage/blobstore.js";
+import type { ScopeResolver } from "../scope.js";
 
 // A blob hash is the lowercase hex SHA-256 of the ciphertext: 64 hex chars. The
 // server recomputes this exact function over the reassembled bytes on finalize
@@ -84,7 +83,15 @@ function parseRange(
 //
 // maxBlobSize is the operator-configured server-side cap. The client also
 // checks before uploading, but this is the real guarantee.
-export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: number): Router {
+//
+// Phase 1.3a: the router receives ONLY a ScopeResolver — no Store and, unlike
+// before, no raw BlobStore. Every byte operation (staging a part, assembling,
+// discarding a session, storing or reading whole-blob bytes) goes through the
+// account-bound AccountScope, so the ownership check and the byte access are
+// one call and cannot drift apart. The byte NAMESPACE stays global
+// (content-addressed); what changed is that this file can no longer touch it
+// except through the account's own metadata/session rows.
+export function blobsRouter(resolve: ScopeResolver, maxBlobSize: number): Router {
   const router = Router();
 
   // Raw body for upload parts: any content-type, capped at the max blob size
@@ -127,13 +134,14 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
     // it without possessing the bytes — a cross-account confidentiality oracle.
     // An account that does not yet have the row uploads the bytes itself and thus
     // proves possession, even if the identical bytes happen to be on disk.
-    if (store.getBlob(body.accountId, body.blobHash) !== null) {
+    const scoped = resolve(req, body.accountId);
+    if (scoped.getBlob(body.blobHash) !== null) {
       res.status(200).json({ exists: true, blobHash: body.blobHash });
       return;
     }
 
     const uploadId = randomUUID();
-    store.createUploadSession(body.accountId, uploadId, body.blobHash, body.size);
+    scoped.createUploadSession(uploadId, body.blobHash, body.size);
     res.status(201).json({ uploadId, blobHash: body.blobHash, received: [] });
   });
 
@@ -147,12 +155,13 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
       res.status(400).json({ error: "accountId is required" });
       return;
     }
-    const session = store.getUploadSession(accountId, req.params.uploadId);
+    const scoped = resolve(req, accountId);
+    const session = scoped.getUploadSession(req.params.uploadId);
     if (session === null) {
       res.status(404).json({ error: "unknown upload session" });
       return;
     }
-    const parts = store.listUploadParts(session.uploadId);
+    const parts = scoped.listUploadParts(session.uploadId);
     const receivedBytes = parts.reduce((sum, p) => sum + p.size, 0);
     res.status(200).json({
       uploadId: session.uploadId,
@@ -178,7 +187,8 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
         res.status(400).json({ error: "accountId is required" });
         return;
       }
-      const session = store.getUploadSession(accountId, req.params.uploadId);
+      const scoped = resolve(req, accountId);
+      const session = scoped.getUploadSession(req.params.uploadId);
       if (session === null) {
         res.status(404).json({ error: "unknown upload session" });
         return;
@@ -192,7 +202,7 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
 
       // Running total: replace this index's prior size (a re-send), add the new
       // part. Reject if the parts would exceed the declared total.
-      const parts = store.listUploadParts(session.uploadId);
+      const parts = scoped.listUploadParts(session.uploadId);
       const priorForIndex = parts.find((p) => p.partIndex === index)?.size ?? 0;
       const total = parts.reduce((sum, p) => sum + p.size, 0) - priorForIndex + bytes.length;
       if (total > session.declaredSize) {
@@ -200,10 +210,10 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
         return;
       }
 
-      blobStore.writePart(session.uploadId, index, bytes);
-      store.recordUploadPart(session.uploadId, index, bytes.length);
+      // Stage bytes then record the part row, as one ownership-checked call.
+      scoped.stageUploadPart(session.uploadId, index, bytes);
 
-      const acked = store.listUploadParts(session.uploadId);
+      const acked = scoped.listUploadParts(session.uploadId);
       res.status(200).json({
         received: acked.map((p) => ({ index: p.partIndex, size: p.size })),
         receivedBytes: acked.reduce((sum, p) => sum + p.size, 0),
@@ -227,8 +237,8 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
         res.status(400).json({ error: "accountId is required" });
         return;
       }
-      const accountId = body.accountId;
-      const session = store.getUploadSession(accountId, req.params.uploadId);
+      const scoped = resolve(req, body.accountId);
+      const session = scoped.getUploadSession(req.params.uploadId);
       if (session === null) {
         res.status(404).json({ error: "unknown upload session" });
         return;
@@ -241,19 +251,16 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
       // caller could obtain a metadata row (and thus download rights) without
       // ever supplying the bytes. When the account lacks the row we fall through
       // to reassemble + hash-verify below, which forces genuine possession.
-      const owned = store.getBlob(accountId, session.blobHash);
+      const owned = scoped.getBlob(session.blobHash);
       if (owned !== null) {
-        blobStore.discardSession(session.uploadId);
-        store.deleteUploadSession(session.uploadId);
+        scoped.discardUploadSession(session.uploadId);
         res
           .status(200)
           .json({ blobHash: session.blobHash, size: owned.size, stored: true, deduped: true });
         return;
       }
 
-      const parts = store.listUploadParts(session.uploadId);
-      const orderedIndexes = parts.map((p) => p.partIndex);
-      const assembled = blobStore.assemble(session.uploadId, orderedIndexes);
+      const assembled = scoped.assembleUpload(session.uploadId);
 
       if (assembled.length > maxBlobSize) {
         res.status(413).json({ error: "blob exceeds maximum size", maxBlobSize });
@@ -265,8 +272,7 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
         // Integrity failure: the reassembled bytes do not hash to the declared
         // address. Reject and discard the bad staging; the client must restart
         // with a fresh session.
-        blobStore.discardSession(session.uploadId);
-        store.deleteUploadSession(session.uploadId);
+        scoped.discardUploadSession(session.uploadId);
         res.status(400).json({
           error: "hash mismatch: reassembled bytes do not match declared blobHash",
           declared: session.blobHash,
@@ -275,10 +281,9 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
         return;
       }
 
-      blobStore.put(session.blobHash, assembled);
-      store.insertBlobIfAbsent(accountId, session.blobHash, assembled.length);
-      blobStore.discardSession(session.uploadId);
-      store.deleteUploadSession(session.uploadId);
+      scoped.putBlobBytes(session.blobHash, assembled);
+      scoped.insertBlobIfAbsent(session.blobHash, assembled.length);
+      scoped.discardUploadSession(session.uploadId);
       res.status(200).json({ blobHash: session.blobHash, size: assembled.length, stored: true });
     },
   );
@@ -298,7 +303,7 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
       res.status(400).json({ error: "accountId is required" });
       return;
     }
-    const rec = store.addBlobReference(body.accountId, req.params.hash);
+    const rec = resolve(req, body.accountId).addBlobReference(req.params.hash);
     if (rec === null) {
       res.status(404).json({ error: "blob not found" });
       return;
@@ -327,7 +332,7 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
       res.status(400).json({ error: "accountId is required" });
       return;
     }
-    const rec = store.releaseBlobReference(body.accountId, req.params.hash);
+    const rec = resolve(req, body.accountId).releaseBlobReference(req.params.hash);
     if (rec === null) {
       res.status(404).json({ error: "blob not found" });
       return;
@@ -355,7 +360,7 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
       res.status(400).end();
       return;
     }
-    const rec = store.getBlob(accountId, req.params.hash);
+    const rec = resolve(req, accountId).getBlob(req.params.hash);
     if (rec === null) {
       res.status(404).end();
       return;
@@ -381,15 +386,11 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
       res.status(400).json({ error: "accountId is required" });
       return;
     }
-    const rec = store.getBlob(accountId, req.params.hash);
-    if (rec === null) {
-      res.status(404).json({ error: "not found" });
-      return;
-    }
-    const stat = blobStore.stat(req.params.hash);
+    const scoped = resolve(req, accountId);
+    // One gated call covers both 404s: no metadata row for this account, or a
+    // row whose bytes are gone (fail closed). Check and stat are inseparable.
+    const stat = scoped.statBlobBytes(req.params.hash);
     if (stat === null) {
-      // Metadata row exists but the bytes are gone. Reclaim is not built in this
-      // phase, so this should not happen; fail closed rather than serve nothing.
       res.status(404).json({ error: "not found" });
       return;
     }
@@ -406,14 +407,14 @@ export function blobsRouter(store: Store, blobStore: BlobStore, maxBlobSize: num
     if (range === null) {
       res.status(200);
       res.setHeader("Content-Length", String(size));
-      res.end(size === 0 ? Buffer.alloc(0) : blobStore.readRange(req.params.hash, 0, size - 1));
+      res.end(size === 0 ? Buffer.alloc(0) : scoped.readBlobRange(req.params.hash, 0, size - 1));
       return;
     }
     const { start, end } = range;
     res.status(206);
     res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
     res.setHeader("Content-Length", String(end - start + 1));
-    res.end(blobStore.readRange(req.params.hash, start, end));
+    res.end(scoped.readBlobRange(req.params.hash, start, end));
   });
 
   return router;
