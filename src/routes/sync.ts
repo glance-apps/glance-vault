@@ -1,6 +1,7 @@
 import { Router, json, type Request, type Response } from "express";
-import type { Store, SyncRowInput, SyncRowRecord } from "../storage/types.js";
+import type { SyncRowInput, SyncRowRecord } from "../storage/types.js";
 import type { Emit } from "../realtime/hub.js";
+import type { ScopeResolver } from "../scope.js";
 
 // The three apps that share this server. The app path param is validated against
 // this set; anything else is rejected with 400.
@@ -37,6 +38,11 @@ function queryAccountId(req: Request): string | null {
 // (mounted after the auth middleware in server.ts). No crypto, no envelope
 // parsing, no intents, no media: just opaque rows in and out with server
 // assigned seq ordering.
+// The router receives a ScopeResolver, not a store (Phase 1.3a): each handler
+// extracts the claimed accountId exactly as before, resolves it to an
+// account-bound AccountScope, and has no other object through which account
+// data is reachable. In shared mode the resolver binds the claimed account
+// unchanged, so behavior is byte-identical.
 // emit is the best-effort real-time push hook (Phase 9). After a write that
 // advances the account seq commits, we call emit(accountId, { seq }) so any
 // connected SSE client for that account is nudged to drain. emit is guaranteed
@@ -44,7 +50,7 @@ function queryAccountId(req: Request): string | null {
 // dead ones); it is called AFTER the store write returns (durably committed) so
 // a nudged client that drains immediately sees the new rows. Push is an
 // optimization only: it never gates or fails the write.
-export function syncRouter(store: Store, emit: Emit): Router {
+export function syncRouter(resolve: ScopeResolver, emit: Emit): Router {
   const router = Router();
 
   // Validate the app path param once for every route that carries it.
@@ -127,7 +133,8 @@ export function syncRouter(store: Store, emit: Emit): Router {
       });
     }
 
-    const result = store.batchUpsert(app, body.accountId, rows);
+    const scoped = resolve(req, body.accountId);
+    const result = scoped.batchUpsert(app, rows);
     // Real-time nudge (Phase 9), emitted ONLY for content writes. Two gates:
     //   - notify: a client marks a per-cycle BOOKKEEPING write (device-state /
     //     cursor / high-water-mark persisted as a sync row) with `notify: false`.
@@ -177,7 +184,7 @@ export function syncRouter(store: Store, emit: Emit): Router {
       res.status(400).json({ error: "lastSeenSeq must be a non-negative integer" });
       return;
     }
-    store.updateDeviceCursor(body.accountId, body.deviceId, body.lastSeenSeq);
+    resolve(req, body.accountId).updateDeviceCursor(body.deviceId, body.lastSeenSeq);
     res.status(200).json({ updated: true });
   });
 
@@ -212,7 +219,7 @@ export function syncRouter(store: Store, emit: Emit): Router {
       }
     }
 
-    const result = store.listRows(app, accountId, since, limit);
+    const result = resolve(req, accountId).listRows(app, since, limit);
     res.status(200).json({
       rows: result.rows.map(serializeRow),
       hasMore: result.hasMore,
@@ -230,7 +237,7 @@ export function syncRouter(store: Store, emit: Emit): Router {
       res.status(400).json({ error: "accountId is required" });
       return;
     }
-    const row = store.getRow(req.params.app, accountId, req.params.entityId);
+    const row = resolve(req, accountId).getRow(req.params.app, req.params.entityId);
     if (row === null) {
       res.status(404).json({ error: "not found" });
       return;
@@ -257,7 +264,7 @@ export function syncRouter(store: Store, emit: Emit): Router {
       }
       deletedAt = parsed;
     }
-    const result = store.softDeleteRow(req.params.app, accountId, req.params.entityId, deletedAt);
+    const result = resolve(req, accountId).softDeleteRow(req.params.app, req.params.entityId, deletedAt);
     if (result === null) {
       res.status(404).json({ error: "not found" });
       return;

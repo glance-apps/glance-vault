@@ -154,16 +154,152 @@ export interface CredentialRecord {
   createdAt: string;
 }
 
-// Thin storage interface. Request handlers depend only on this interface, never
-// on a concrete database. SQLite is the only implementation in Phase 0; a
-// Postgres implementation can be added later by satisfying this same contract
-// without touching any handler code.
+// The storage interfaces, split along the account boundary (Phase 1.3a).
 //
-// The interface stays deliberately small. Sync data methods land in Phase 1;
-// intents and media data methods arrive with their respective phases. What
-// every backend must provide from day one is migration on boot, a per-account
-// monotonic sequence source, a way to run work in a transaction, and clean
-// shutdown.
+// AccountStore is the only surface through which account-scoped data can be
+// read or written. It is obtained EXCLUSIVELY via Store.forAccount(accountId):
+// every method is pre-bound to that one account, so "which account does this
+// query touch" is decided at construction, once, rather than re-supplied (and
+// re-trusted) on every call. Request handlers receive an AccountStore (via the
+// scope resolver in server.ts) and never see the root Store, which makes an
+// unscoped — or wrongly-scoped — data access inexpressible in a handler rather
+// than merely not written. Today the resolver binds the account the client
+// claims (shared-token trust model, unchanged); a later phase changes only
+// WHERE the bound account comes from (the authenticated credential), not any of
+// this shape.
+//
+// The handle is a STATELESS parameter binder and must stay one: it holds no
+// cache, no cursor, and no transaction state, and every method body runs
+// exactly the statement(s) it always ran — in particular, seq assignment stays
+// inside the write transaction that stamps the row (see nextSeq).
+export interface AccountStore {
+  // The account every method below is bound to. Introspection only.
+  readonly accountId: string;
+
+  // Assign the next monotonic sequence number for this account. Strictly
+  // increasing, with no duplicates. Intended to be called from inside a write
+  // transaction so the assigned seq commits atomically with the row it stamps.
+  nextSeq(): number;
+
+  // Read the account's current latest seq WITHOUT advancing it, or 0 if the
+  // account has never had a seq assigned. A pure read: unlike nextSeq it never
+  // bumps the counter. Used by the SSE push endpoint to send a connecting client
+  // the account's current position (the initial reconcile signal).
+  latestSeq(): number;
+
+  // Upsert a batch of sync rows for one app. Each row is assigned a freshly
+  // bumped seq inside a single transaction, so seq assignment and the row write
+  // commit atomically or not at all. On conflict the existing row's envelope,
+  // seq, deleted, and server_mtime are replaced with the new values, so a
+  // re-upserted row advances past its previous cursor position. A row marked
+  // insertOnly is the exception: if its entity already exists it is skipped
+  // entirely (not overwritten and not assigned a seq), so written counts only
+  // the rows actually inserted or overwritten.
+  batchUpsert(app: string, rows: SyncRowInput[]): BatchResult;
+
+  // Incremental fetch: rows for this app with seq strictly greater than since,
+  // ordered by seq ascending, capped at limit. hasMore reports whether more
+  // rows remain past the returned page.
+  listRows(app: string, since: number, limit: number): ListResult;
+
+  // Fetch a single row by entity_id, or null if it does not exist.
+  getRow(app: string, entityId: string): SyncRowRecord | null;
+
+  // Soft-delete a row: mark deleted, assign a new seq, update server_mtime, and
+  // record the client-supplied deletedAt (epoch ms; null when the client omits
+  // it), all in one transaction. Returns the new seq, or null if the row does
+  // not exist.
+  softDeleteRow(app: string, entityId: string, deletedAt?: number | null): { seq: number } | null;
+
+  // Insert a batch of intent events. INSERT-ONLY: a re-sent event_id is a
+  // harmless no-op, never an update, and consumes no seq. Each newly inserted
+  // event is assigned a freshly bumped seq from the same per-account source as
+  // sync. Returns the count actually inserted and the highest seq assigned.
+  // Expired rows for this account are pruned lazily as part of the same write.
+  insertIntents(events: IntentEventInput[]): IntentBatchResult;
+
+  // Incremental intents fetch: events with seq strictly greater than since,
+  // ordered by seq ascending, capped at limit. Only non-expired rows are
+  // returned. Mirrors listRows, minus the app scope (intents are cross-app).
+  listIntents(since: number, limit: number): IntentListResult;
+
+  // Fetch the key-derivation salt, or null if none is stored yet. The salt is
+  // an opaque base64 string the server never decodes.
+  getSalt(): SaltRecord | null;
+
+  // Store the salt if and only if none exists yet, then return whatever is
+  // stored. First-write-wins: an existing salt is never overwritten, and the
+  // returned value is always the stored one, not necessarily the supplied one.
+  putSaltIfAbsent(salt: string): SaltRecord & { created: boolean };
+
+  // Move a device's cursor forward. Upserts the (account, device) row, advancing
+  // last_seen_seq to the MAX of the stored and supplied values so the cursor
+  // never goes backward, and refreshing last_active. Used later for coordinated
+  // tombstone GC.
+  updateDeviceCursor(deviceId: string, lastSeenSeq: number): void;
+
+  // --- Blob metadata + reference tracking ---
+
+  // Fetch a blob's metadata row, or null if this account has no record of it.
+  getBlob(blobHash: string): BlobRecord | null;
+
+  // Insert the metadata row for a freshly stored blob, idempotently. If a row
+  // already exists for this hash it is left untouched. On first insert the blob
+  // starts at zero references with zeroRefSeq stamped from the per-account seq
+  // source. created reports whether this call inserted the row.
+  insertBlobIfAbsent(blobHash: string, size: number): { record: BlobRecord; created: boolean };
+
+  // Report a reference ADD: increment refCount, clear zeroRefSeq, refresh
+  // lastReferenceActivityAt. Returns the updated row, or null if the blob is
+  // not stored for this account. NO deletion happens here.
+  addBlobReference(blobHash: string): BlobRecord | null;
+
+  // Report a reference RELEASE: decrement refCount (clamped at zero) and
+  // refresh lastReferenceActivityAt. A true 1 -> 0 transition stamps zeroRefSeq
+  // with a fresh per-account seq. Returns the updated row, or null if the blob
+  // is not stored for this account. NO deletion happens here.
+  releaseBlobReference(blobHash: string): BlobRecord | null;
+
+  // --- Resumable upload sessions (transfer-layer) ---
+
+  // Create an upload session, owned by this account, for a whole blob being
+  // sent in parts.
+  createUploadSession(uploadId: string, blobHash: string, declaredSize: number): void;
+
+  // Fetch a session by id IF this account owns it, or null. This is the
+  // ownership check every subsequent upload step's 404 rides on.
+  getUploadSession(uploadId: string): UploadSessionRecord | null;
+
+  // Record that a part was received (idempotent on (uploadId, partIndex)).
+  // ACCOUNT-ENFORCED AT THE STATEMENT LEVEL: the insert joins
+  // blob_upload_sessions on this account, so a part can never be recorded
+  // against a session this account does not own — the statement simply affects
+  // zero rows. The route's session lookup makes that unreachable; the join
+  // makes it impossible.
+  recordUploadPart(uploadId: string, partIndex: number, size: number): void;
+
+  // List the acked parts of a session this account owns, ascending by index.
+  // Statement-level scoped like recordUploadPart: another account's session
+  // yields an empty list, indistinguishable from an unknown uploadId.
+  listUploadParts(uploadId: string): UploadPartRecord[];
+
+  // Delete a session this account owns, and its part records (cascade). The
+  // staged part BYTES are removed separately via the BlobStore. Scoped at the
+  // statement level: another account's session is untouched (zero rows).
+  deleteUploadSession(uploadId: string): void;
+}
+
+// Thin storage interface — the ROOT store. Request handlers never see this
+// type: they receive an AccountStore from the scope resolver, and this root
+// interface deliberately cannot read or write account data at all except by
+// constructing an AccountStore via forAccount (the one named, greppable
+// gateway). What remains here is lifecycle plus the legitimately-global
+// operations: boot-time migration, the health report, and the sweeps (blob
+// reclaim, upload reaper, intent pruning) that operate across all accounts on
+// server-derived rows rather than caller-supplied scope.
+//
+// SQLite is the only implementation; a Postgres implementation can be added
+// later by satisfying this same contract without touching any handler code.
 export interface Store {
   // Apply any pending migrations. Safe to call on every boot; a no-op once the
   // database is already at the current schema version.
@@ -172,149 +308,20 @@ export interface Store {
   // The schema version the storage is currently at. Reported by /healthz.
   schemaVersion(): number;
 
-  // Assign the next monotonic sequence number for an account. Strictly
-  // increasing per account_id, with no duplicates. Intended to be called from
-  // inside a write transaction so the assigned seq commits atomically with the
-  // row it stamps.
-  nextSeq(accountId: string): number;
-
-  // Read the account's current latest seq WITHOUT advancing it, or 0 if the
-  // account has never had a seq assigned. A pure read: unlike nextSeq it never
-  // bumps the counter. Used by the SSE push endpoint to send a connecting client
-  // the account's current position (the initial reconcile signal).
-  latestSeq(accountId: string): number;
-
   // Run fn inside a single write transaction. If fn throws, the transaction is
   // rolled back. Returns whatever fn returns.
   transaction<T>(fn: () => T): T;
 
-  // Upsert a batch of sync rows for one app and account. Each row is assigned a
-  // freshly bumped seq inside a single transaction, so seq assignment and the
-  // row write commit atomically or not at all. On conflict the existing row's
-  // envelope, seq, deleted, and server_mtime are replaced with the new values,
-  // so a re-upserted row advances past its previous cursor position. A row marked
-  // insertOnly is the exception: if its entity already exists it is skipped
-  // entirely (not overwritten and not assigned a seq), so written counts only the
-  // rows actually inserted or overwritten.
-  batchUpsert(app: string, accountId: string, rows: SyncRowInput[]): BatchResult;
+  // Construct the account-bound data handle — the ONLY way to reach
+  // account-scoped data from this interface. Cheap and stateless: it binds the
+  // accountId parameter and nothing else, so constructing one per request is
+  // the intended usage.
+  forAccount(accountId: string): AccountStore;
 
-  // Incremental fetch: rows for this app and account with seq strictly greater
-  // than since, ordered by seq ascending, capped at limit. hasMore reports
-  // whether more rows remain past the returned page.
-  listRows(app: string, accountId: string, since: number, limit: number): ListResult;
-
-  // Fetch a single row by entity_id, or null if it does not exist.
-  getRow(app: string, accountId: string, entityId: string): SyncRowRecord | null;
-
-  // Soft-delete a row: mark deleted, assign a new seq, update server_mtime, and
-  // record the client-supplied deletedAt (epoch ms; null when the client omits
-  // it), all in one transaction. Returns the new seq, or null if the row does
-  // not exist.
-  softDeleteRow(
-    app: string,
-    accountId: string,
-    entityId: string,
-    deletedAt?: number | null,
-  ): { seq: number } | null;
-
-  // Insert a batch of intent events for one account. INSERT-ONLY: a re-sent
-  // event_id is a harmless no-op (INSERT ... ON CONFLICT (account_id, event_id)
-  // DO NOTHING), never an update, and consumes no seq. Each newly inserted event
-  // is assigned a freshly bumped seq from the same per-account source as sync, so
-  // intents seq is strictly monotonic within intent_events. Returns the count
-  // actually inserted and the highest seq assigned. Expired rows for this account
-  // are pruned lazily as part of the same write.
-  insertIntents(accountId: string, events: IntentEventInput[]): IntentBatchResult;
-
-  // Incremental intents fetch: events for this account with seq strictly greater
-  // than since, ordered by seq ascending, capped at limit. Only non-expired rows
-  // (expires_at > now) are returned, so a client never sees an expired intent
-  // even between prune sweeps. hasMore reports whether more rows remain past the
-  // returned page. Mirrors listRows, minus the app scope (intents are cross-app).
-  listIntents(accountId: string, since: number, limit: number): IntentListResult;
-
-  // Hard-delete expired intent events (expires_at <= now). Scoped to one account
-  // when accountId is given, otherwise a global sweep across all accounts.
-  // Returns the number of rows deleted. Intents are disposable, so a slightly
-  // late prune is harmless; this is called lazily on write and may also be run
-  // as an occasional sweep.
-  pruneExpiredIntents(accountId?: string): number;
-
-  // Fetch the key-derivation salt for an account, or null if none is stored yet.
-  // The salt is an opaque base64 string the server never decodes.
-  getSalt(accountId: string): SaltRecord | null;
-
-  // Store the salt for an account if and only if none exists yet, then return
-  // whatever is stored. First-write-wins: an existing salt is never overwritten,
-  // and the returned value is always the stored one, not necessarily the
-  // supplied one. created is true when this call stored a new salt.
-  putSaltIfAbsent(accountId: string, salt: string): SaltRecord & { created: boolean };
-
-  // Move a device's cursor forward. Upserts the (account, device) row, advancing
-  // last_seen_seq to the MAX of the stored and supplied values so the cursor
-  // never goes backward, and refreshing last_active. The cursor is account
-  // scoped (seq is assigned per account, shared across apps), not per app. Used
-  // later for coordinated tombstone GC.
-  updateDeviceCursor(accountId: string, deviceId: string, lastSeenSeq: number): void;
-
-  // --- Blob metadata + reference tracking (Phase 7) ---
-
-  // Fetch a blob's metadata row, or null if the server has no record of it for
-  // this account.
-  getBlob(accountId: string, blobHash: string): BlobRecord | null;
-
-  // Insert the metadata row for a freshly stored blob, idempotently. If a row
-  // already exists for (account, blobHash) it is left untouched (content-
-  // addressing idempotency, analogous to an insert-only intent). On first
-  // insert the blob starts at zero references with zeroRefSeq stamped from the
-  // per-account seq source (it is at zero from creation until something
-  // references it). created reports whether this call inserted the row.
-  insertBlobIfAbsent(
-    accountId: string,
-    blobHash: string,
-    size: number,
-  ): { record: BlobRecord; created: boolean };
-
-  // Report a reference ADD for (account, blobHash): increment refCount, clear
-  // zeroRefSeq (the blob is no longer at zero), and refresh
-  // lastReferenceActivityAt. Returns the updated row, or null if the blob is
-  // not stored (the blobs-before-reference invariant means the blob must exist
-  // first). NO deletion happens here.
-  addBlobReference(accountId: string, blobHash: string): BlobRecord | null;
-
-  // Report a reference RELEASE for (account, blobHash): decrement refCount
-  // (clamped at zero) and refresh lastReferenceActivityAt. If this release
-  // takes the blob from one reference to zero, stamp zeroRefSeq with a fresh
-  // per-account seq (the cursor point reclaim later checks against device
-  // acks). Returns the updated row, or null if the blob is not stored. NO
-  // deletion happens here: at zero the blob is merely eligible; actual reclaim
-  // is a separate later step and the default policy is RETAIN.
-  releaseBlobReference(accountId: string, blobHash: string): BlobRecord | null;
-
-  // --- Resumable upload sessions (Phase 7, transfer-layer) ---
-
-  // Create an upload session for a whole blob being sent in parts.
-  createUploadSession(
-    accountId: string,
-    uploadId: string,
-    blobHash: string,
-    declaredSize: number,
-  ): void;
-
-  // Fetch a session by id, scoped to the account, or null if unknown.
-  getUploadSession(accountId: string, uploadId: string): UploadSessionRecord | null;
-
-  // Record that a part was received (idempotent on (uploadId, partIndex): a
-  // re-sent part updates its size and timestamp rather than duplicating).
-  recordUploadPart(uploadId: string, partIndex: number, size: number): void;
-
-  // List the acked parts of a session, ascending by index. Drives both the
-  // resume point report and the reassembly order on finalize.
-  listUploadParts(uploadId: string): UploadPartRecord[];
-
-  // Delete a session and its part records (on finalize success or abort). The
-  // staged part BYTES are removed separately via the BlobStore.
-  deleteUploadSession(uploadId: string): void;
+  // Hard-delete expired intent events across ALL accounts (expires_at <= now).
+  // Returns the number of rows deleted. The per-account lazy prune runs inside
+  // insertIntents; this global form exists for an occasional sweep.
+  pruneExpiredIntents(): number;
 
   // List upload sessions created at or before the cutoff (an ISO timestamp),
   // for the stale-session reaper. Returns the uploadId and accountId of each so
@@ -322,28 +329,27 @@ export interface Store {
   // READ ONLY: deletes nothing itself.
   listStaleUploadSessions(cutoff: string): { uploadId: string; accountId: string }[];
 
-  // --- Blob reclaim / garbage collection (Phase 7 final step) ---
+  // Sweep-side session delete (upload reaper): removes a session row (parts
+  // cascade) for a session identified by the reaper's own listing, not by a
+  // caller-supplied scope. Handlers use AccountStore.deleteUploadSession.
+  deleteUploadSession(uploadId: string): void;
 
   // Find blobs eligible for reclaim, evaluating ALL THREE conditions from spec
   // section 8.3 as one query across every account (this is a global sweep):
   //   (a) zero references (ref_count == 0),
-  //   (b) grace elapsed: last_reference_activity_at <= graceCutoff
-  //       (graceCutoff = now - grace_period),
+  //   (b) grace elapsed: last_reference_activity_at <= graceCutoff,
   //   (c) all NON-DEAD devices acked past the zero point: no device in the
-  //       blob's account is both non-dead (last_active > deadCutoff, where
-  //       deadCutoff = now - dead_device_period) AND behind the zero point
-  //       (last_seen_seq < zero_ref_seq).
-  // zero_ref_seq is on the same per-account seq line as devices.last_seen_seq
-  // (both from nextSeq()/account_seq), so comparison (c) is meaningful. This is
-  // a READ ONLY query: it deletes nothing. The caller (the reclaim sweep)
-  // deletes the bytes then the row for each returned blob. Cutoffs are passed in
-  // as ISO strings so all time logic lives in the sweep, not the store.
+  //       blob's account is both non-dead (last_active > deadCutoff) AND behind
+  //       the zero point (last_seen_seq < zero_ref_seq).
+  // zero_ref_seq is on the same per-account seq line as devices.last_seen_seq,
+  // so comparison (c) is meaningful. READ ONLY: it deletes nothing. Cutoffs are
+  // passed in as ISO strings so all time logic lives in the sweep.
   listReclaimableBlobs(graceCutoff: string, deadCutoff: string): BlobRecord[];
 
-  // Hard-delete a blob's metadata row. Returns true if a row was deleted, false
-  // if it was already gone (idempotent: a repeated sweep does not error or
-  // double-delete). The bytes are removed separately via the BlobStore. This and
-  // the sweep are the ONLY places a blob is ever deleted.
+  // Sweep-side hard-delete of a blob's metadata row (blob reclaim). Returns
+  // true if a row was deleted, false if already gone (idempotent). The
+  // accountId comes from the reclaim listing's own rows, never from a caller-
+  // supplied request scope. The bytes are removed separately via the BlobStore.
   deleteBlob(accountId: string, blobHash: string): boolean;
 
   // Release underlying resources (database handle, etc.).

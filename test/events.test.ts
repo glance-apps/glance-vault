@@ -10,6 +10,8 @@ import type { Server } from "node:http";
 import { SqliteStore } from "../src/storage/sqlite.js";
 import { buildApp } from "../src/server.js";
 import { eventsRouter } from "../src/routes/events.js";
+import { makeScopeResolver } from "../src/scope.js";
+import { DiskBlobStore } from "../src/storage/disk-blobstore.js";
 import { deviceTokenAuth } from "../src/middleware/auth.js";
 import { InProcessAccountHub, type Nudge, type Subscriber } from "../src/realtime/hub.js";
 
@@ -75,7 +77,11 @@ async function startEventsOnly(heartbeatMs: number): Promise<Harness> {
   const hub = new InProcessAccountHub();
   const app = express();
   app.use(deviceTokenAuth(TOKEN));
-  app.use("/events", eventsRouter(store, hub, { heartbeatMs }));
+  // The events router takes the scope resolver, like every router post-1.3a.
+  // The DiskBlobStore is inert here (events never touch bytes) and touches no
+  // disk until a blob is written.
+  const resolve = makeScopeResolver(store, new DiskBlobStore(join(dir, "blobs")));
+  app.use("/events", eventsRouter(resolve, hub, { heartbeatMs }));
   const server = await listen(app);
   const { port } = server.address() as AddressInfo;
   return {
@@ -661,7 +667,7 @@ test("a device-cursor (bookkeeping) write emits no nudge and does not advance th
     assert.deepEqual(rep.body, { updated: true });
 
     // It also does not touch the account seq (bookkeeping never calls nextSeq).
-    assert.equal(h.store.latestSeq(account), 0, "the cursor report did not advance the seq");
+    assert.equal(h.store.forAccount(account).latestSeq(), 0, "the cursor report did not advance the seq");
     // And no activity nudge is delivered within the window.
     await assert.rejects(c.nextEvent("activity", 300), /timed out/, "a cursor report fires no nudge");
     c.close();
@@ -714,7 +720,7 @@ test("a bookkeeping batch write (notify:false) commits and advances seq but fire
     assert.equal(write.status, 200);
     assert.equal(write.body.written, 1, "the bookkeeping row was still written");
     assert.equal(write.body.maxSeq, 1, "and it still advanced the account seq");
-    assert.equal(h.store.latestSeq(account), 1, "the seq really advanced (write not gated)");
+    assert.equal(h.store.forAccount(account).latestSeq(), 1, "the seq really advanced (write not gated)");
 
     // No nudge for the suppressed write...
     await assert.rejects(

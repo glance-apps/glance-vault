@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import type {
   Store,
+  AccountStore,
   SyncRowInput,
   SyncRowRecord,
   BatchResult,
@@ -148,7 +149,7 @@ export class SqliteStore implements Store {
   // Single atomic upsert. INSERT ... ON CONFLICT ... RETURNING is one statement
   // and therefore atomic on its own, and it also composes correctly when called
   // from within an outer transaction() so the seq commits alongside its write.
-  nextSeq(accountId: string): number {
+  private nextSeq(accountId: string): number {
     const row = this.db
       .prepare(
         `INSERT INTO account_seq (account_id, value)
@@ -163,7 +164,7 @@ export class SqliteStore implements Store {
   // Current latest seq for an account, read-only (never advances the counter).
   // Returns 0 when the account has no account_seq row yet — i.e. nothing has
   // ever been written for it, so its position is the pre-first-write baseline.
-  latestSeq(accountId: string): number {
+  private latestSeq(accountId: string): number {
     const row = this.db
       .prepare(`SELECT value FROM account_seq WHERE account_id = ?`)
       .get(accountId) as { value: number } | undefined;
@@ -182,7 +183,7 @@ export class SqliteStore implements Store {
   // newly assigned seq (excluded.seq) rather than the original, so a re-upserted
   // row advances past its previous cursor position. A single batch of K rows
   // advances the account seq by exactly K, never more.
-  batchUpsert(app: string, accountId: string, rows: SyncRowInput[]): BatchResult {
+  private batchUpsert(app: string, accountId: string, rows: SyncRowInput[]): BatchResult {
     // An identical re-send (same envelope bytes) intentionally advances seq
     // rather than no-opping. This is the designed behavior: it keeps every write
     // a uniform "assign a new seq and overwrite" so a partial-write retry is
@@ -246,7 +247,7 @@ export class SqliteStore implements Store {
 
   // Incremental fetch. Over-fetch by one row to determine hasMore without a
   // separate COUNT, then trim back to the requested limit.
-  listRows(app: string, accountId: string, since: number, limit: number): ListResult {
+  private listRows(app: string, accountId: string, since: number, limit: number): ListResult {
     const dbRows = this.db
       .prepare(
         `SELECT entity_id, envelope, seq, deleted, server_mtime, deleted_at
@@ -262,7 +263,7 @@ export class SqliteStore implements Store {
     return { rows: page.map(toRecord), hasMore };
   }
 
-  getRow(app: string, accountId: string, entityId: string): SyncRowRecord | null {
+  private getRow(app: string, accountId: string, entityId: string): SyncRowRecord | null {
     const row = this.db
       .prepare(
         `SELECT entity_id, envelope, seq, deleted, server_mtime, deleted_at
@@ -277,7 +278,7 @@ export class SqliteStore implements Store {
   // record the client-supplied deletedAt (epoch ms) inside one transaction.
   // deletedAt is null when the client omits it (legacy clients / delete-wins).
   // Returns null if the row does not exist.
-  softDeleteRow(
+  private softDeleteRow(
     app: string,
     accountId: string,
     entityId: string,
@@ -316,7 +317,7 @@ export class SqliteStore implements Store {
   // DO NOTHING clause is a belt-and-suspenders guarantee of insert-only
   // semantics. Expired rows for this account are pruned lazily in the same
   // transaction (intents are disposable; a slightly late prune is harmless).
-  insertIntents(accountId: string, events: IntentEventInput[]): IntentBatchResult {
+  private insertIntents(accountId: string, events: IntentEventInput[]): IntentBatchResult {
     const exists = this.db.prepare(
       `SELECT 1 FROM intent_events WHERE account_id = ? AND event_id = ?`,
     );
@@ -350,7 +351,7 @@ export class SqliteStore implements Store {
           maxSeq = seq;
         }
       }
-      this.pruneExpiredIntents(accountId);
+      this.pruneExpiredIntentsFor(accountId);
       return { written, maxSeq };
     });
   }
@@ -359,7 +360,7 @@ export class SqliteStore implements Store {
   // hasMore without a COUNT), with two differences from sync: no app scope
   // (intents are the cross-app channel) and an expires_at > now filter so an
   // expired-but-not-yet-pruned row never reaches a client.
-  listIntents(accountId: string, since: number, limit: number): IntentListResult {
+  private listIntents(accountId: string, since: number, limit: number): IntentListResult {
     const now = new Date().toISOString();
     const dbRows = this.db
       .prepare(
@@ -376,22 +377,28 @@ export class SqliteStore implements Store {
     return { rows: page.map(toIntentRecord), hasMore };
   }
 
-  // Hard-delete expired intent events. Scoped to one account when accountId is
-  // given (the lazy-on-write path), otherwise a global sweep. The single DELETE
-  // is atomic on its own and also composes inside an outer transaction (the
-  // insert path calls it within its IMMEDIATE transaction).
-  pruneExpiredIntents(accountId?: string): number {
+  // Hard-delete expired intent events across ALL accounts — the occasional
+  // global sweep. The single DELETE is atomic on its own. The per-account
+  // lazy-on-write form is pruneExpiredIntentsFor below, which composes inside
+  // insertIntents' IMMEDIATE transaction.
+  pruneExpiredIntents(): number {
     const now = new Date().toISOString();
-    const info =
-      accountId === undefined
-        ? this.db.prepare(`DELETE FROM intent_events WHERE expires_at <= ?`).run(now)
-        : this.db
-            .prepare(`DELETE FROM intent_events WHERE account_id = ? AND expires_at <= ?`)
-            .run(accountId, now);
+    const info = this.db.prepare(`DELETE FROM intent_events WHERE expires_at <= ?`).run(now);
     return info.changes;
   }
 
-  getSalt(accountId: string): SaltRecord | null {
+  // The per-account form of the prune, run lazily inside insertIntents' write
+  // transaction. Private: request-scoped pruning is an internal detail of the
+  // intents write path, not part of either public interface.
+  private pruneExpiredIntentsFor(accountId: string): number {
+    const now = new Date().toISOString();
+    const info = this.db
+      .prepare(`DELETE FROM intent_events WHERE account_id = ? AND expires_at <= ?`)
+      .run(accountId, now);
+    return info.changes;
+  }
+
+  private getSalt(accountId: string): SaltRecord | null {
     const row = this.db
       .prepare(`SELECT account_id, salt, created_at FROM account_salts WHERE account_id = ?`)
       .get(accountId) as { account_id: string; salt: string; created_at: string } | undefined;
@@ -407,7 +414,7 @@ export class SqliteStore implements Store {
   // returned salt is always whatever is actually stored, never the supplied
   // value. created reflects whether this call is the one that inserted, derived
   // from the row's change count.
-  putSaltIfAbsent(accountId: string, salt: string): SaltRecord & { created: boolean } {
+  private putSaltIfAbsent(accountId: string, salt: string): SaltRecord & { created: boolean } {
     return this.transaction(() => {
       const info = this.db
         .prepare(
@@ -427,7 +434,7 @@ export class SqliteStore implements Store {
   // conflict, last_seen_seq becomes MAX(existing, supplied) so a stale or
   // out-of-order report can never move a cursor backward. last_active is always
   // refreshed to now.
-  updateDeviceCursor(accountId: string, deviceId: string, lastSeenSeq: number): void {
+  private updateDeviceCursor(accountId: string, deviceId: string, lastSeenSeq: number): void {
     this.db
       .prepare(
         `INSERT INTO devices (account_id, device_id, last_seen_seq, last_active)
@@ -441,7 +448,7 @@ export class SqliteStore implements Store {
 
   // --- Blob metadata + reference tracking (Phase 7) ---
 
-  getBlob(accountId: string, blobHash: string): BlobRecord | null {
+  private getBlob(accountId: string, blobHash: string): BlobRecord | null {
     const row = this.db
       .prepare(
         `SELECT account_id, blob_hash, size, ref_count, zero_ref_seq,
@@ -461,7 +468,7 @@ export class SqliteStore implements Store {
   // trackable toward reclaim later). Both steps run in one IMMEDIATE
   // transaction, and the row is read back AFTER the insert attempt so the
   // returned record is always the stored one.
-  insertBlobIfAbsent(
+  private insertBlobIfAbsent(
     accountId: string,
     blobHash: string,
     size: number,
@@ -490,7 +497,7 @@ export class SqliteStore implements Store {
   // longer at zero), and refresh last_reference_activity_at, all in one
   // transaction. Returns null if the blob is not stored (blobs-before-reference:
   // the bytes must exist before a reference to them is reported).
-  addBlobReference(accountId: string, blobHash: string): BlobRecord | null {
+  private addBlobReference(accountId: string, blobHash: string): BlobRecord | null {
     return this.transaction(() => {
       const existing = this.getBlob(accountId, blobHash);
       if (!existing) {
@@ -516,7 +523,7 @@ export class SqliteStore implements Store {
   // release of an already-zero blob is a harmless no-op that leaves the existing
   // zero point in place. NO deletion happens here: at zero the blob is merely
   // eligible, and the default policy is RETAIN. Returns null if not stored.
-  releaseBlobReference(accountId: string, blobHash: string): BlobRecord | null {
+  private releaseBlobReference(accountId: string, blobHash: string): BlobRecord | null {
     return this.transaction(() => {
       const existing = this.getBlob(accountId, blobHash);
       if (!existing) {
@@ -549,7 +556,7 @@ export class SqliteStore implements Store {
 
   // --- Resumable upload sessions (Phase 7) ---
 
-  createUploadSession(
+  private createUploadSession(
     accountId: string,
     uploadId: string,
     blobHash: string,
@@ -564,7 +571,7 @@ export class SqliteStore implements Store {
       .run(uploadId, accountId, blobHash, declaredSize, new Date().toISOString());
   }
 
-  getUploadSession(accountId: string, uploadId: string): UploadSessionRecord | null {
+  private getUploadSession(accountId: string, uploadId: string): UploadSessionRecord | null {
     const row = this.db
       .prepare(
         `SELECT upload_id, account_id, blob_hash, declared_size, created_at
@@ -593,31 +600,64 @@ export class SqliteStore implements Store {
 
   // Idempotent part record: a re-sent part (resume / retry) updates its size and
   // timestamp rather than duplicating, so the acked-parts set stays accurate.
-  recordUploadPart(uploadId: string, partIndex: number, size: number): void {
+  // ACCOUNT-ENFORCED AT THE STATEMENT LEVEL (Phase 1.3a): the INSERT sources its
+  // row from a SELECT that requires the session to belong to this account, so a
+  // part can never be recorded against another account's session — the
+  // statement affects zero rows. This closes, in SQL, what was previously only
+  // guaranteed by every route checking getUploadSession first.
+  private recordUploadPart(
+    accountId: string,
+    uploadId: string,
+    partIndex: number,
+    size: number,
+  ): void {
     this.db
       .prepare(
         `INSERT INTO blob_upload_parts (upload_id, part_index, size, received_at)
-         VALUES (?, ?, ?, ?)
+         SELECT s.upload_id, @part_index, @size, @received_at
+         FROM blob_upload_sessions s
+         WHERE s.upload_id = @upload_id AND s.account_id = @account_id
          ON CONFLICT (upload_id, part_index) DO UPDATE SET
            size = excluded.size,
            received_at = excluded.received_at`,
       )
-      .run(uploadId, partIndex, size, new Date().toISOString());
+      .run({
+        upload_id: uploadId,
+        account_id: accountId,
+        part_index: partIndex,
+        size,
+        received_at: new Date().toISOString(),
+      });
   }
 
-  listUploadParts(uploadId: string): UploadPartRecord[] {
+  // Statement-level scoped like recordUploadPart: the join makes another
+  // account's session indistinguishable from an unknown uploadId (empty list).
+  private listUploadParts(accountId: string, uploadId: string): UploadPartRecord[] {
     const rows = this.db
       .prepare(
-        `SELECT part_index, size, received_at
-         FROM blob_upload_parts WHERE upload_id = ?
-         ORDER BY part_index ASC`,
+        `SELECT p.part_index, p.size, p.received_at
+         FROM blob_upload_parts p
+         JOIN blob_upload_sessions s ON s.upload_id = p.upload_id
+         WHERE p.upload_id = ? AND s.account_id = ?
+         ORDER BY p.part_index ASC`,
       )
-      .all(uploadId) as { part_index: number; size: number; received_at: string }[];
+      .all(uploadId, accountId) as { part_index: number; size: number; received_at: string }[];
     return rows.map((r) => ({ partIndex: r.part_index, size: r.size, receivedAt: r.received_at }));
   }
 
-  // Delete the session; the parts rows cascade (FK ON DELETE CASCADE). The
-  // staged part bytes are removed separately via the BlobStore.
+  // Account-scoped session delete (the handler-side form). The account
+  // predicate is in the DELETE itself, so another account's session is
+  // untouched (zero rows), not merely unreached.
+  private deleteUploadSessionFor(accountId: string, uploadId: string): void {
+    this.db
+      .prepare(`DELETE FROM blob_upload_sessions WHERE upload_id = ? AND account_id = ?`)
+      .run(uploadId, accountId);
+  }
+
+  // Sweep-side session delete (upload reaper): the uploadId comes from
+  // listStaleUploadSessions' own rows, never from a request. Parts rows cascade
+  // (FK ON DELETE CASCADE); the staged bytes are removed separately via the
+  // BlobStore. Handlers go through AccountStore.deleteUploadSession instead.
   deleteUploadSession(uploadId: string): void {
     this.db.prepare(`DELETE FROM blob_upload_sessions WHERE upload_id = ?`).run(uploadId);
   }
@@ -670,6 +710,42 @@ export class SqliteStore implements Store {
       .prepare(`DELETE FROM blobs WHERE account_id = ? AND blob_hash = ?`)
       .run(accountId, blobHash);
     return info.changes > 0;
+  }
+
+  // The one gateway to account-scoped data (Phase 1.3a). Returns a STATELESS
+  // parameter binder: every method simply calls the corresponding private
+  // method with accountId pre-bound. No cache, no cursor, no transaction state
+  // lives on the handle — in particular every nextSeq call still happens inside
+  // the write transaction that stamps its row, exactly as before the split.
+  // Constructing one per request is the intended usage.
+  forAccount(accountId: string): AccountStore {
+    return {
+      accountId,
+      nextSeq: () => this.nextSeq(accountId),
+      latestSeq: () => this.latestSeq(accountId),
+      batchUpsert: (app, rows) => this.batchUpsert(app, accountId, rows),
+      listRows: (app, since, limit) => this.listRows(app, accountId, since, limit),
+      getRow: (app, entityId) => this.getRow(app, accountId, entityId),
+      softDeleteRow: (app, entityId, deletedAt) =>
+        this.softDeleteRow(app, accountId, entityId, deletedAt),
+      insertIntents: (events) => this.insertIntents(accountId, events),
+      listIntents: (since, limit) => this.listIntents(accountId, since, limit),
+      getSalt: () => this.getSalt(accountId),
+      putSaltIfAbsent: (salt) => this.putSaltIfAbsent(accountId, salt),
+      updateDeviceCursor: (deviceId, lastSeenSeq) =>
+        this.updateDeviceCursor(accountId, deviceId, lastSeenSeq),
+      getBlob: (blobHash) => this.getBlob(accountId, blobHash),
+      insertBlobIfAbsent: (blobHash, size) => this.insertBlobIfAbsent(accountId, blobHash, size),
+      addBlobReference: (blobHash) => this.addBlobReference(accountId, blobHash),
+      releaseBlobReference: (blobHash) => this.releaseBlobReference(accountId, blobHash),
+      createUploadSession: (uploadId, blobHash, declaredSize) =>
+        this.createUploadSession(accountId, uploadId, blobHash, declaredSize),
+      getUploadSession: (uploadId) => this.getUploadSession(accountId, uploadId),
+      recordUploadPart: (uploadId, partIndex, size) =>
+        this.recordUploadPart(accountId, uploadId, partIndex, size),
+      listUploadParts: (uploadId) => this.listUploadParts(accountId, uploadId),
+      deleteUploadSession: (uploadId) => this.deleteUploadSessionFor(accountId, uploadId),
+    };
   }
 
   close(): void {

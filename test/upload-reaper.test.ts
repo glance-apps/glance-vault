@@ -87,21 +87,21 @@ test("the reaper sweeps a stale session (row + staged bytes) but spares a fresh 
     // createUploadSession stamps created_at from the real clock, so we drive the
     // reaper's clock forward relative to when we create the sessions rather than
     // trying to backdate the row.
-    store.createUploadSession("acct", "old-upload", "a".repeat(64), 1000);
+    store.forAccount("acct").createUploadSession("old-upload", "a".repeat(64), 1000);
     blobStore.writePart("old-upload", 0, randomBytes(500));
 
     // Reaper with a 1ms TTL, run "far in the future": the session is stale.
     const future = new Date(Date.now() + 60 * 60 * 1000);
     const result = reapUploadSessions(store, blobStore, 1, future, () => {});
     assert.equal(result.swept, 1, "the stale session was swept");
-    assert.equal(store.getUploadSession("acct", "old-upload"), null, "session row is gone");
-    assert.deepEqual(store.listUploadParts("old-upload"), [], "part records cascaded away");
+    assert.equal(store.forAccount("acct").getUploadSession("old-upload"), null, "session row is gone");
+    assert.deepEqual(store.forAccount("acct").listUploadParts("old-upload"), [], "part records cascaded away");
 
     // A fresh session created now, swept with a long TTL, is spared.
-    store.createUploadSession("acct", "fresh-upload", "b".repeat(64), 1000);
+    store.forAccount("acct").createUploadSession("fresh-upload", "b".repeat(64), 1000);
     const spared = reapUploadSessions(store, blobStore, 24 * 60 * 60 * 1000, new Date(), () => {});
     assert.equal(spared.swept, 0, "a session within the TTL is not swept");
-    assert.notEqual(store.getUploadSession("acct", "fresh-upload"), null, "fresh session survives");
+    assert.notEqual(store.forAccount("acct").getUploadSession("fresh-upload"), null, "fresh session survives");
 
     store.close();
   } finally {
@@ -115,7 +115,7 @@ test("listStaleUploadSessions returns only sessions at/before the cutoff", () =>
   try {
     const store = new SqliteStore(path);
     store.migrate();
-    store.createUploadSession("acct", "u1", "c".repeat(64), 10);
+    store.forAccount("acct").createUploadSession("u1", "c".repeat(64), 10);
     // A cutoff far in the future catches it; one far in the past does not.
     const futureCutoff = new Date(Date.now() + 60_000).toISOString();
     const pastCutoff = new Date(Date.now() - 60_000).toISOString();
@@ -131,13 +131,13 @@ test("an abandoned upload over HTTP is later reaped end to end", async () => {
   const h = await startServer();
   try {
     const uploadId = await startButAbandon(h.base, "acct-abandon");
-    assert.notEqual(h.store.getUploadSession("acct-abandon", uploadId), null, "session exists after abandon");
+    assert.notEqual(h.store.forAccount("acct-abandon").getUploadSession(uploadId), null, "session exists after abandon");
 
     // Sweep with a tiny TTL from a future clock: the session and its staged bytes go.
     const future = new Date(Date.now() + 60 * 60 * 1000);
     const result = reapUploadSessions(h.store, h.blobStore, 1, future, () => {});
     assert.equal(result.swept, 1);
-    assert.equal(h.store.getUploadSession("acct-abandon", uploadId), null, "reaped session is gone");
+    assert.equal(h.store.forAccount("acct-abandon").getUploadSession(uploadId), null, "reaped session is gone");
   } finally {
     h.close();
   }

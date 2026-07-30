@@ -20,7 +20,7 @@ test("nextSeq is strictly monotonic in a single writer", () => {
 
     let previous = 0;
     for (let i = 0; i < 1000; i++) {
-      const seq = store.nextSeq("acct-a");
+      const seq = store.forAccount("acct-a").nextSeq();
       assert.equal(seq, previous + 1, "seq should increase by exactly one");
       previous = seq;
     }
@@ -36,11 +36,11 @@ test("nextSeq is per-account, independent counters", () => {
     const store = new SqliteStore(path);
     store.migrate();
 
-    assert.equal(store.nextSeq("acct-a"), 1);
-    assert.equal(store.nextSeq("acct-b"), 1);
-    assert.equal(store.nextSeq("acct-a"), 2);
-    assert.equal(store.nextSeq("acct-b"), 2);
-    assert.equal(store.nextSeq("acct-a"), 3);
+    assert.equal(store.forAccount("acct-a").nextSeq(), 1);
+    assert.equal(store.forAccount("acct-b").nextSeq(), 1);
+    assert.equal(store.forAccount("acct-a").nextSeq(), 2);
+    assert.equal(store.forAccount("acct-b").nextSeq(), 2);
+    assert.equal(store.forAccount("acct-a").nextSeq(), 3);
     store.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

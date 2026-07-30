@@ -4,6 +4,7 @@ import type { Store } from "./storage/types.js";
 import type { BlobStore } from "./storage/blobstore.js";
 import { DiskBlobStore } from "./storage/disk-blobstore.js";
 import { deviceTokenAuth } from "./middleware/auth.js";
+import { makeScopeResolver } from "./scope.js";
 import { cors } from "./middleware/cors.js";
 import { requestLog } from "./middleware/request-log.js";
 import { rateLimit } from "./middleware/rate-limit.js";
@@ -97,21 +98,33 @@ export function buildApp(
   // and non-blocking by contract, so a push failure can never affect a write.
   const emit: Emit = (accountId, nudge) => accountHub.publish(accountId, nudge);
 
+  const blobs = blobStore ?? new DiskBlobStore(config.blobStorePath ?? defaultBlobStorePath(config.storagePath));
+  const maxBlobSize = config.maxBlobSize ?? DEFAULT_MAX_BLOB_SIZE;
+
+  // The scope resolver (Phase 1.3a): the ONLY path from a request to account
+  // data. Routers receive this instead of the store, so a handler physically
+  // has no object through which an unscoped (or wrongly-scoped) access could be
+  // written. In this phase the resolver binds the claimed accountId in both
+  // auth modes — behavior is byte-identical to before the split; a later phase
+  // changes only what happens inside makeScopeResolver. The root store stays in
+  // this function for /healthz (schemaVersion) and is handed to the sweeps by
+  // index.ts; after the interface split it cannot read account data itself
+  // except via forAccount.
+  const resolveScope = makeScopeResolver(store, blobs);
+
   // Protected routes. Phase 1 adds the sync transport; the salt store is a
   // Phase 3 prerequisite; intents are the cross-app transport; Phase 7 adds the
   // content-addressed blob store; Phase 9 adds the SSE real-time push endpoint.
-  app.use("/sync", syncRouter(store, emit));
-  app.use("/intents", intentsRouter(store, emit));
-  app.use("/salt", saltRouter(store));
+  app.use("/sync", syncRouter(resolveScope, emit));
+  app.use("/intents", intentsRouter(resolveScope, emit));
+  app.use("/salt", saltRouter(resolveScope));
 
-  const blobs = blobStore ?? new DiskBlobStore(config.blobStorePath ?? defaultBlobStorePath(config.storagePath));
-  const maxBlobSize = config.maxBlobSize ?? DEFAULT_MAX_BLOB_SIZE;
-  app.use("/blobs", blobsRouter(store, blobs, maxBlobSize));
+  app.use("/blobs", blobsRouter(resolveScope, maxBlobSize));
 
   // Real-time push (nudge-only SSE), authenticated and account-scoped exactly
   // like the routes above. See routes/events.ts for the event shape and the
   // reverse-proxy flush requirement.
-  app.use("/events", eventsRouter(store, accountHub));
+  app.use("/events", eventsRouter(resolveScope, accountHub));
 
   return app;
 }
