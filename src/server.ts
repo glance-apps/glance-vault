@@ -1,10 +1,11 @@
-import express, { type Express } from "express";
+import express, { type Express, type Request, type Response, type NextFunction } from "express";
 import { DEFAULT_MAX_BLOB_SIZE, defaultBlobStorePath, type Config } from "./config.js";
 import type { Store } from "./storage/types.js";
 import type { BlobStore } from "./storage/blobstore.js";
 import { DiskBlobStore } from "./storage/disk-blobstore.js";
 import { deviceTokenAuth } from "./middleware/auth.js";
-import { makeScopeResolver } from "./scope.js";
+import { makeScopeResolver, ScopeError } from "./scope.js";
+import { credentialAuth } from "./middleware/credential-auth.js";
 import { enrollRouter, bootstrapSecretValidator } from "./routes/enroll.js";
 import { cors } from "./middleware/cors.js";
 import { requestLog } from "./middleware/request-log.js";
@@ -106,7 +107,19 @@ export function buildApp(
     app.use("/enroll", enrollRouter(store, bootstrapSecretValidator(config.enrollmentSecret!)));
   }
 
-  app.use(deviceTokenAuth(config.deviceToken));
+  // Request auth (Phase 1.3b): a registration-level mode branch, like the
+  // /enroll gate above — no handler branches on mode. Shared mode mounts the
+  // shared-token middleware exactly as always. Per-account mode mounts the
+  // credential middleware IN ITS PLACE: the Bearer token is the per-device
+  // credential, 401s (absent/malformed/unrecognized) happen at the same
+  // pipeline position they always have, and the shared device token
+  // authenticates nothing — honoring it would let any holder keep acting on
+  // any account, the vulnerability enforcement closes.
+  if (config.authMode === "per-account") {
+    app.use(credentialAuth(store));
+  } else {
+    app.use(deviceTokenAuth(config.deviceToken));
+  }
 
   // The best-effort emission hook wired to the hub. Passed to the write routers
   // so they nudge connected clients after a commit. hub.publish is non-throwing
@@ -125,7 +138,7 @@ export function buildApp(
   // this function for /healthz (schemaVersion) and is handed to the sweeps by
   // index.ts; after the interface split it cannot read account data itself
   // except via forAccount.
-  const resolveScope = makeScopeResolver(store, blobs);
+  const resolveScope = makeScopeResolver(store, blobs, config.authMode ?? "shared");
 
   // Protected routes. Phase 1 adds the sync transport; the salt store is a
   // Phase 3 prerequisite; intents are the cross-app transport; Phase 7 adds the
@@ -140,6 +153,22 @@ export function buildApp(
   // like the routes above. See routes/events.ts for the event shape and the
   // reverse-proxy flush requirement.
   app.use("/events", eventsRouter(resolveScope, accountHub));
+
+  // The scope-rejection mapper (Phase 1.3b), mounted after every router. It
+  // intercepts EXACTLY the resolver's ScopeError throws — the class exists
+  // nowhere else — and translates them to the uniform 401/403 JSON. Every
+  // other error takes next(err) to Express's default handler, exactly as if
+  // this middleware did not exist; existing error responses (all written
+  // directly to res by handlers) never enter the error path at all. The
+  // eslint-style unused `next` parameter is required: Express dispatches by
+  // arity, and a 4-arg signature is what marks an error middleware.
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (err instanceof ScopeError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    next(err);
+  });
 
   return app;
 }
