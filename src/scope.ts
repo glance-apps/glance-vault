@@ -1,6 +1,32 @@
 import type { Request } from "express";
 import type { Store, AccountStore } from "./storage/types.js";
 import type { BlobStore, BlobStat } from "./storage/blobstore.js";
+import type { AuthMode } from "./config.js";
+import { authenticatedCredential } from "./middleware/credential-auth.js";
+
+// Thrown by the scope resolver when a request's account claim cannot be
+// bound, and translated to a response by the single error-mapping middleware
+// at the tail of buildApp. This class exists NOWHERE else: the middleware
+// intercepts exactly these rejections and passes every other error through
+// untouched.
+//
+// Statuses, decided for the whole workstream and uniform across all 18
+// routes:
+//   403 — the credential AUTHENTICATED but claims an account it is not bound
+//         to. Distinct from 401 so later phases can add further distinct
+//         terminal signals (revoked in 2.1, billing-lapsed in item 5) without
+//         overloading one status.
+//   401 — no authenticated credential reached the resolver (belt-and-
+//         suspenders: the credential middleware already 401s this before any
+//         handler runs).
+export class ScopeError extends Error {
+  readonly status: 401 | 403;
+
+  constructor(status: 401 | 403, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
 
 // The per-request account scope (Phase 1.3a).
 //
@@ -67,12 +93,20 @@ export interface AccountScope extends AccountStore {
 // How a handler obtains its AccountScope. The handler extracts the CLAIMED
 // accountId exactly where it always has (body, query string, or path param —
 // which is why this cannot be a single pre-body-parse middleware), then calls
-// the resolver. In this phase the resolver simply binds the claimed account in
-// BOTH auth modes — byte-for-byte the shared-token trust model. A later phase
-// changes only what happens inside the resolver (derive the account from the
-// authenticated credential on req, reject a mismatch); the handler-facing
-// shape, including the req parameter that phase will need, is fixed here so
-// that phase touches one function instead of eighteen handlers.
+// the resolver.
+//
+// Phase 1.3b: the resolver is where enforcement lives, and the ONLY place.
+//   shared      — bind the claimed account, byte-for-byte the shared-token
+//                 trust model. Untouched.
+//   per-account — the operative account comes FROM THE CREDENTIAL the auth
+//                 middleware verified; the claimed value is demoted to a
+//                 cross-check. A mismatch throws ScopeError(403) before any
+//                 data access. The comparison is BYTE-EXACT: no trimming,
+//                 casing, or normalization — " house-1" and "house-1" are
+//                 distinct live accounts today and must stay that way.
+// A resolver that returns, returns a scope bound to an account the caller has
+// proven; a handler that holds an AccountScope can no longer be holding the
+// wrong account.
 export type ScopeResolver = (req: Request, claimedAccountId: string) => AccountScope;
 
 // Build one AccountScope: the storage handle plus the byte-gate methods, all
@@ -141,11 +175,37 @@ export function makeAccountScope(
   };
 }
 
-// Build the resolver buildApp hands to every router. Identical in shared and
-// per-account mode in this phase: bind the claimed account. The req parameter
-// is deliberately part of the signature now, unused, so the enforcement phase
-// changes this one function body and nothing else.
-export function makeScopeResolver(store: Store, blobStore: BlobStore): ScopeResolver {
-  return (_req: Request, claimedAccountId: string) =>
-    makeAccountScope(store, blobStore, claimedAccountId);
+// Build the resolver buildApp hands to every router. The authMode parameter
+// is required — a silently-defaulted mode would be a fail-open waiting for a
+// forgotten argument; buildApp passes the loadConfig-resolved value.
+export function makeScopeResolver(
+  store: Store,
+  blobStore: BlobStore,
+  authMode: AuthMode,
+): ScopeResolver {
+  if (authMode === "shared") {
+    // The shipped trust model, byte-for-byte: bind whatever account the
+    // request names. deviceTokenAuth has already gated passage.
+    return (_req: Request, claimedAccountId: string) =>
+      makeAccountScope(store, blobStore, claimedAccountId);
+  }
+
+  // per-account: derive, compare, bind the DERIVED account.
+  return (req: Request, claimedAccountId: string) => {
+    const credential = authenticatedCredential(req);
+    if (credential === undefined) {
+      // Unreachable when the credential middleware is mounted (it 401s
+      // first); if a future mount-order mistake ever exposes a scoped route
+      // without it, fail closed as 401 rather than fall back to trusting the
+      // claim.
+      throw new ScopeError(401, "no authenticated credential");
+    }
+    if (credential.accountId !== claimedAccountId) {
+      throw new ScopeError(403, "credential is not bound to this account");
+    }
+    // Bind the account the CREDENTIAL is bound to. Byte-equal to the claim at
+    // this point, but the derivation is structural: the operative account
+    // never comes from the request.
+    return makeAccountScope(store, blobStore, credential.accountId);
+  };
 }

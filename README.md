@@ -129,12 +129,15 @@ anything today: one instance-wide device token, and each request names the
 account it acts on. That is the right trust boundary for a self-hosted instance
 run by one household or operator.
 
-`per-account` is reserved for per-device credentials that the server resolves to
-an account itself. **Enforcement is not implemented yet.** Setting it changes no
-request handling — the server logs a warning at startup saying so — but it does
-register one additional endpoint, `POST /enroll`, where a device exchanges the
-admin-configured bootstrap secret (`GLANCEVAULT_ENROLLMENT_SECRET`, required in
-this mode) for its own per-device credential:
+`per-account` turns on per-device credentials that the server resolves to an
+account itself. In this mode the Bearer token every scoped request presents is
+the device's own credential — the shared device token authenticates nothing
+(the server warns about this at startup) — and the server derives the operative
+account from the credential: a request whose `accountId` does not byte-exactly
+match the credential's account is rejected with `403`, and an absent, malformed,
+or unrecognized credential gets `401 invalid credential`. Devices obtain their
+credential at `POST /enroll` by exchanging the admin-configured bootstrap secret
+(`GLANCEVAULT_ENROLLMENT_SECRET`, required in this mode):
 
 ```
 curl -X POST https://vault.example.com/enroll \
@@ -147,8 +150,9 @@ The `credential` value appears in that response once and is never retrievable
 again (the server stores only a hash). The device saves its credential and
 **discards the bootstrap secret** — nothing ever asks for the secret again, and
 re-enrolling always mints a fresh credential rather than returning an old one.
-No handler consults these credentials yet. Leave `per-account` unset unless you
-are developing that path.
+
+`shared` deployments are unaffected: switching modes is an explicit operator
+decision, and enrolled credentials mean nothing to a `shared`-mode server.
 
 An unrecognized value is rejected at startup rather than quietly falling back,
 so a typo cannot leave you believing an auth model is on when it is not.

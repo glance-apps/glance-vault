@@ -24,11 +24,21 @@ function main(): void {
   // scoped exactly as in "shared" mode. Say so loudly rather than let an operator
   // believe they have turned on an enforcement that is not built yet.
   if (config.authMode === "per-account") {
+    // Enforcement is live (Phase 1.3b): every scoped request must present a
+    // per-device credential, and the operative account is derived from it. The
+    // shared device token is still REQUIRED BY CONFIG but authenticates
+    // nothing in this mode — say so, or the operator's first signal is a
+    // fleet of 401s.
+    console.log(
+      "auth: per-account enforcement is active. Requests authenticate with " +
+        "per-device credentials (enroll at POST /enroll); a client-supplied " +
+        "accountId that does not match the credential is rejected with 403.",
+    );
     console.warn(
-      "auth: GLANCEVAULT_AUTH_MODE=per-account is set, but per-account " +
-        "enforcement is not implemented yet. Requests are handled exactly as in " +
-        "shared mode (enrollment at POST /enroll issues credentials that no " +
-        "handler consults yet). Do not rely on this flag for access control.",
+      "auth: GLANCEVAULT_DEVICE_TOKEN is configured but the shared device " +
+        "token authenticates NOTHING in per-account mode. Clients presenting " +
+        "it will receive 401 invalid credential; devices must enroll for " +
+        "per-device credentials instead.",
     );
     // Footgun, not a broken state: an enrollment secret equal to the shared
     // device token collapses the two trust levels (any token holder could

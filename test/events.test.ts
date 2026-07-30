@@ -80,7 +80,9 @@ async function startEventsOnly(heartbeatMs: number): Promise<Harness> {
   // The events router takes the scope resolver, like every router post-1.3a.
   // The DiskBlobStore is inert here (events never touch bytes) and touches no
   // disk until a blob is written.
-  const resolve = makeScopeResolver(store, new DiskBlobStore(join(dir, "blobs")));
+  // Mode is a required parameter (a missing mode fails CLOSED, not open);
+  // this harness exercises the shared path.
+  const resolve = makeScopeResolver(store, new DiskBlobStore(join(dir, "blobs")), "shared");
   app.use("/events", eventsRouter(resolve, hub, { heartbeatMs }));
   const server = await listen(app);
   const { port } = server.address() as AddressInfo;

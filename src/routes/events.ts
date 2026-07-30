@@ -77,6 +77,11 @@ export function eventsRouter(resolve: ScopeResolver, hub: AccountHub, opts: Even
     // closes. resolve() is pure construction, so placing it here (before the
     // cap check) changes no observable ordering.
     const scoped = resolve(req, accountId);
+    // The ONE string both hub calls key on (Phase 1.3b): the scope's derived
+    // account. subscribe and the cleanup closure's unsubscribe share this
+    // binding by construction — if they ever keyed on different strings, a
+    // subscriber would leak in the hub permanently.
+    const boundAccount = scoped.accountId;
 
     const sub: Subscriber = {
       id: nextId++,
@@ -93,7 +98,7 @@ export function eventsRouter(resolve: ScopeResolver, hub: AccountHub, opts: Even
 
     // Enforce the per-account connection cap BEFORE any header is written, so an
     // over-cap client gets a clean 429 rather than a half-open stream.
-    if (!hub.subscribe(accountId, sub)) {
+    if (!hub.subscribe(boundAccount, sub)) {
       res.status(429).json({ error: "too many connections for account" });
       return;
     }
@@ -122,7 +127,7 @@ export function eventsRouter(resolve: ScopeResolver, hub: AccountHub, opts: Even
       }
       cleaned = true;
       clearInterval(heartbeat);
-      hub.unsubscribe(accountId, sub);
+      hub.unsubscribe(boundAccount, sub);
     };
 
     // Periodic heartbeat comment to keep the connection alive through idle

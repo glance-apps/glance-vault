@@ -148,7 +148,10 @@ export function syncRouter(resolve: ScopeResolver, emit: Emit): Router {
     // The WRITE is never gated — only the nudge is. Post-commit, best-effort:
     // emit never throws and never blocks the response.
     if (notify && result.maxSeq > 0) {
-      emit(body.accountId, { seq: result.maxSeq });
+      // Keyed by the scope's DERIVED account, not the request's claimed
+      // string (Phase 1.3b): byte-equal after a successful resolve, but the
+      // binding is structural rather than by adjacency.
+      emit(scoped.accountId, { seq: result.maxSeq });
     }
     res.status(200).json(result);
   });
@@ -264,14 +267,16 @@ export function syncRouter(resolve: ScopeResolver, emit: Emit): Router {
       }
       deletedAt = parsed;
     }
-    const result = resolve(req, accountId).softDeleteRow(req.params.app, req.params.entityId, deletedAt);
+    const scoped = resolve(req, accountId);
+    const result = scoped.softDeleteRow(req.params.app, req.params.entityId, deletedAt);
     if (result === null) {
       res.status(404).json({ error: "not found" });
       return;
     }
     // A soft-delete advances the account seq (a new tombstone seq), so nudge
-    // connected clients to drain. Post-commit, best-effort.
-    emit(accountId, { seq: result.seq });
+    // connected clients to drain. Post-commit, best-effort. Keyed by the
+    // scope's derived account (Phase 1.3b), not the claimed string.
+    emit(scoped.accountId, { seq: result.seq });
     res.status(200).json(result);
   });
 

@@ -111,14 +111,17 @@ export function intentsRouter(resolve: ScopeResolver, emit: Emit): Router {
       });
     }
 
-    const result = resolve(req, body.accountId).insertIntents(events);
+    const scoped = resolve(req, body.accountId);
+    const result = scoped.insertIntents(events);
     // A landed intent is always CONTENT — an insert-only cross-device message
     // another device must pull — never bookkeeping, so it nudges unconditionally
     // (there is no notify opt-out here, unlike the sync batch path). Emit only
     // when a new intent actually landed (maxSeq is 0 when every event was an
     // insert-only re-send). Post-commit, best-effort.
     if (result.maxSeq > 0) {
-      emit(body.accountId, { seq: result.maxSeq });
+      // Keyed by the scope's derived account (Phase 1.3b), not the claimed
+      // string — same binding as the sync emits.
+      emit(scoped.accountId, { seq: result.maxSeq });
     }
     res.status(200).json(result);
   });
