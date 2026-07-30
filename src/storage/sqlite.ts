@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import type {
   Store,
   AccountStore,
+  CredentialRecord,
   SyncRowInput,
   SyncRowRecord,
   BatchResult,
@@ -710,6 +711,58 @@ export class SqliteStore implements Store {
       .prepare(`DELETE FROM blobs WHERE account_id = ? AND blob_hash = ?`)
       .run(accountId, blobHash);
     return info.changes > 0;
+  }
+
+  // --- Credentials (Phase 1.2) — root-level auth metadata, not account data ---
+
+  // Insert-only persistence of a freshly minted credential. No read, no
+  // upsert: enrollment always mints fresh (non-idempotent by design), and the
+  // UNIQUE index on credential_hash makes an astronomically-unlikely verifier
+  // collision a loud constraint error rather than a silent overwrite. Consumes
+  // no account seq and touches no other table.
+  insertCredential(input: {
+    credentialId: string;
+    accountId: string;
+    deviceId: string;
+    credentialHash: string;
+  }): CredentialRecord {
+    const createdAt = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO device_credentials
+           (credential_id, account_id, device_id, credential_hash, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(input.credentialId, input.accountId, input.deviceId, input.credentialHash, createdAt);
+    return { ...input, createdAt };
+  }
+
+  // Verifier-hash lookup for the enforcement phase (unique-index point read).
+  getCredentialByHash(credentialHash: string): CredentialRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT credential_id, account_id, device_id, credential_hash, created_at
+         FROM device_credentials WHERE credential_hash = ?`,
+      )
+      .get(credentialHash) as
+      | {
+          credential_id: string;
+          account_id: string;
+          device_id: string;
+          credential_hash: string;
+          created_at: string;
+        }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      credentialId: row.credential_id,
+      accountId: row.account_id,
+      deviceId: row.device_id,
+      credentialHash: row.credential_hash,
+      createdAt: row.created_at,
+    };
   }
 
   // The one gateway to account-scoped data (Phase 1.3a). Returns a STATELESS

@@ -15,9 +15,18 @@ test("auth mode defaults to shared", () => {
 });
 
 test("auth mode accepts both modes, trimmed and case-insensitive", () => {
+  // per-account requires an enrollment secret since Phase 1.2, so those
+  // variants carry one; shared needs none.
+  const withSecret = { GLANCEVAULT_ENROLLMENT_SECRET: "boot" };
   assert.equal(loadConfig(env({ GLANCEVAULT_AUTH_MODE: "shared" })).authMode, "shared");
-  assert.equal(loadConfig(env({ GLANCEVAULT_AUTH_MODE: "per-account" })).authMode, "per-account");
-  assert.equal(loadConfig(env({ GLANCEVAULT_AUTH_MODE: "  Per-Account " })).authMode, "per-account");
+  assert.equal(
+    loadConfig(env({ GLANCEVAULT_AUTH_MODE: "per-account", ...withSecret })).authMode,
+    "per-account",
+  );
+  assert.equal(
+    loadConfig(env({ GLANCEVAULT_AUTH_MODE: "  Per-Account ", ...withSecret })).authMode,
+    "per-account",
+  );
 });
 
 test("an unrecognized auth mode is fatal, not silently coerced", () => {
@@ -41,8 +50,11 @@ test("an empty auth mode is treated as unset", () => {
 });
 
 test("auth mode does not disturb the rest of the config", () => {
-  const shared = loadConfig(env({ GLANCEVAULT_AUTH_MODE: "shared" }));
-  const perAccount = loadConfig(env({ GLANCEVAULT_AUTH_MODE: "per-account" }));
+  // Both variants carry the enrollment secret (required in per-account mode
+  // since Phase 1.2) so authMode remains the only differing field.
+  const secret = { GLANCEVAULT_ENROLLMENT_SECRET: "boot" };
+  const shared = loadConfig(env({ GLANCEVAULT_AUTH_MODE: "shared", ...secret }));
+  const perAccount = loadConfig(env({ GLANCEVAULT_AUTH_MODE: "per-account", ...secret }));
   assert.deepEqual(
     { ...shared, authMode: null },
     { ...perAccount, authMode: null },

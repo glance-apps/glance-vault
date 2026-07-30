@@ -27,8 +27,20 @@ function main(): void {
     console.warn(
       "auth: GLANCEVAULT_AUTH_MODE=per-account is set, but per-account " +
         "enforcement is not implemented yet. Requests are handled exactly as in " +
-        "shared mode. Do not rely on this flag for access control.",
+        "shared mode (enrollment at POST /enroll issues credentials that no " +
+        "handler consults yet). Do not rely on this flag for access control.",
     );
+    // Footgun, not a broken state: an enrollment secret equal to the shared
+    // device token collapses the two trust levels (any token holder could
+    // enroll durable per-device credentials). Warn, don't refuse — an
+    // operator may have done this deliberately while testing.
+    if (config.enrollmentSecret === config.deviceToken) {
+      console.warn(
+        "auth: GLANCEVAULT_ENROLLMENT_SECRET equals GLANCEVAULT_DEVICE_TOKEN. " +
+          "Use a distinct secret so holding the shared device token does not " +
+          "also grant the ability to enroll new device credentials.",
+      );
+    }
   }
 
   const store = new SqliteStore(config.storagePath);

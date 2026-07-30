@@ -33,6 +33,9 @@ services:
       # unless you are developing the per-account path — it is not implemented
       # yet and changes no request handling. See the README.
       GLANCEVAULT_AUTH_MODE: ${GLANCEVAULT_AUTH_MODE:-}
+      # Required only when GLANCEVAULT_AUTH_MODE=per-account: the bootstrap
+      # secret devices exchange for per-device credentials at POST /enroll.
+      GLANCEVAULT_ENROLLMENT_SECRET: ${GLANCEVAULT_ENROLLMENT_SECRET:-}
     volumes:
       # Named volume holding the SQLite database file, so it survives restarts.
       # To run as a non-default user (e.g. Unraid's nobody:users, 99:100),

@@ -51,6 +51,7 @@ built-in defaults.
 |---|---|---|---|
 | SQLite file path | `GLANCEVAULT_STORAGE_PATH` | `storagePath` | `./data/glancevault.db` |
 | Auth model | `GLANCEVAULT_AUTH_MODE` | `authMode` | `shared` |
+| Enrollment secret | `GLANCEVAULT_ENROLLMENT_SECRET` | `enrollmentSecret` | none (required in `per-account` mode) |
 | Listen port | `GLANCEVAULT_PORT` | `port` | `8080` |
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
 | Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
@@ -129,9 +130,25 @@ account it acts on. That is the right trust boundary for a self-hosted instance
 run by one household or operator.
 
 `per-account` is reserved for per-device credentials that the server resolves to
-an account itself. **It is not implemented yet.** Setting it changes no request
-handling whatsoever — the server logs a warning at startup saying so. Leave it
-unset unless you are developing that path.
+an account itself. **Enforcement is not implemented yet.** Setting it changes no
+request handling — the server logs a warning at startup saying so — but it does
+register one additional endpoint, `POST /enroll`, where a device exchanges the
+admin-configured bootstrap secret (`GLANCEVAULT_ENROLLMENT_SECRET`, required in
+this mode) for its own per-device credential:
+
+```
+curl -X POST https://vault.example.com/enroll \
+  -H 'Content-Type: application/json' \
+  -d '{"enrollmentSecret":"<the bootstrap secret>","accountId":"house-1","deviceId":"kitchen-tablet"}'
+# -> 201 {"credentialId":"...","credential":"gvc_...","accountId":"house-1",...}
+```
+
+The `credential` value appears in that response once and is never retrievable
+again (the server stores only a hash). The device saves its credential and
+**discards the bootstrap secret** — nothing ever asks for the secret again, and
+re-enrolling always mints a fresh credential rather than returning an old one.
+No handler consults these credentials yet. Leave `per-account` unset unless you
+are developing that path.
 
 An unrecognized value is rejected at startup rather than quietly falling back,
 so a typo cannot leave you believing an auth model is on when it is not.
