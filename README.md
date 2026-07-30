@@ -50,6 +50,7 @@ built-in defaults.
 | Setting | Env var | Config file key | Default |
 |---|---|---|---|
 | SQLite file path | `GLANCEVAULT_STORAGE_PATH` | `storagePath` | `./data/glancevault.db` |
+| Auth model | `GLANCEVAULT_AUTH_MODE` | `authMode` | `shared` |
 | Listen port | `GLANCEVAULT_PORT` | `port` | `8080` |
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
 | Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
@@ -119,6 +120,21 @@ Authorization: Bearer <your-token>
 
 Requests without a valid token are rejected with 401. `GET /healthz` is the
 one exception and needs no token.
+
+### Auth model (`GLANCEVAULT_AUTH_MODE`)
+
+`shared` (the default) is the model described above and the only one that does
+anything today: one instance-wide device token, and each request names the
+account it acts on. That is the right trust boundary for a self-hosted instance
+run by one household or operator.
+
+`per-account` is reserved for per-device credentials that the server resolves to
+an account itself. **It is not implemented yet.** Setting it changes no request
+handling whatsoever — the server logs a warning at startup saying so. Leave it
+unset unless you are developing that path.
+
+An unrecognized value is rejected at startup rather than quietly falling back,
+so a typo cannot leave you believing an auth model is on when it is not.
 
 ## Run with docker compose
 
@@ -255,7 +271,7 @@ curl http://localhost:8080/healthz
 Expected response:
 
 ```json
-{ "status": "ok", "version": "0.1.0", "schemaVersion": 3 }
+{ "status": "ok", "version": "0.1.0", "schemaVersion": 5 }
 ```
 
 ## Sync transport endpoints

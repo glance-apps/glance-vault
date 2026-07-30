@@ -1,5 +1,6 @@
 {
   "storagePath": "./data/glancevault.db",
+  "authMode": "shared",
   "port": 8080,
   "deviceToken": "replace-with-a-long-random-secret",
   "allowedOrigins": [

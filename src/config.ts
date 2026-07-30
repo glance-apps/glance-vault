@@ -5,10 +5,27 @@ import { dirname, join } from "node:path";
 // environment variables. There is no user model and no multi-tenant logic:
 // just where to store data, what port to listen on, and the single shared
 // device token that authenticates every request.
+// How the server establishes which account a request acts on.
+//   "shared"      — the shipped self-hosted model: one instance-wide device
+//                   token, and the account scope is whatever the client asks
+//                   for. Correct for a single trusted household/operator.
+//   "per-account" — the account is derived server-side from an authenticated
+//                   per-device credential. NOT IMPLEMENTED YET: selecting it
+//                   today changes no request handling whatsoever, because the
+//                   derivation and enforcement land in later phases. The flag
+//                   exists now so those phases are additions behind a switch
+//                   that already defaults to the shipped behavior.
+export type AuthMode = "shared" | "per-account";
+
 export interface Config {
   // Filesystem path to the SQLite database file. The parent directory is
   // expected to exist (the docker-compose example mounts a volume for it).
   storagePath: string;
+  // Which auth model the server runs. DEFAULT "shared": byte-for-byte the
+  // behavior self-hosters run today. Optional in the type so test config
+  // literals may omit it; loadConfig always resolves a concrete value, and
+  // nothing currently branches on it.
+  authMode?: AuthMode;
   // TCP port the HTTP server listens on.
   port: number;
   // The single valid device auth token (a shared secret). Required.
@@ -81,6 +98,9 @@ export interface Config {
 
 interface FileConfig {
   storagePath?: string;
+  // Validated against AuthMode in loadConfig, so the file value is typed loosely
+  // here (a hand-edited JSON file can hold anything).
+  authMode?: string;
   port?: number;
   deviceToken?: string;
   allowedOrigins?: string[];
@@ -104,6 +124,10 @@ interface FileConfig {
 
 const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
 const DEFAULT_PORT = 8080;
+// The shipped self-hosted behavior. Every phase of the per-account work stays
+// inert under this default.
+export const DEFAULT_AUTH_MODE: AuthMode = "shared";
+const AUTH_MODES: AuthMode[] = ["shared", "per-account"];
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Reclaim defaults. RETAIN (off) is the safe default; the grace and dead-device
 // windows match spec section 8.3.
@@ -157,6 +181,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const storagePath =
     env.GLANCEVAULT_STORAGE_PATH ?? file.storagePath ?? DEFAULT_STORAGE_PATH;
+
+  // Auth model. Env wins over the file over the default, like every other field.
+  const authMode = normalizeAuthMode(env.GLANCEVAULT_AUTH_MODE ?? file.authMode);
 
   const portRaw = env.GLANCEVAULT_PORT ?? (file.port != null ? String(file.port) : undefined);
   const port = portRaw != null ? Number(portRaw) : DEFAULT_PORT;
@@ -298,6 +325,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   return {
     storagePath,
+    authMode,
     port,
     deviceToken,
     allowedOrigins,
@@ -316,6 +344,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     uploadSessionTtlMs,
     uploadSessionSweepIntervalMs,
   };
+}
+
+// Resolve the auth mode. Unlike the on/off flags above (which coerce anything
+// unrecognized to their safe default), an unrecognized value here is FATAL: this
+// switch decides how requests are authenticated, and a typo silently falling
+// back to "shared" is exactly the failure that must not happen once later phases
+// make "per-account" mean something. Validated like port and maxBlobSize.
+//
+// Whitespace-only is treated as unset rather than invalid, so an env var
+// deliberately passed through empty (the `${VAR:-}` pattern the compose file
+// uses for optional settings) selects the default instead of refusing to boot.
+// Matching is case-insensitive and trimmed; the value is otherwise exact.
+function normalizeAuthMode(raw: string | undefined): AuthMode {
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_AUTH_MODE;
+  }
+  const value = raw.trim().toLowerCase();
+  const match = AUTH_MODES.find((mode) => mode === value);
+  if (!match) {
+    throw new Error(
+      `Invalid GLANCEVAULT_AUTH_MODE: ${raw}. Expected one of: ${AUTH_MODES.join(", ")}.`,
+    );
+  }
+  return match;
 }
 
 // Normalize a trust-proxy config value (env string or file value) into the shape

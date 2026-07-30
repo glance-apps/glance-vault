@@ -29,6 +29,10 @@ services:
       GLANCEVAULT_ALLOWED_ORIGINS: ${GLANCEVAULT_ALLOWED_ORIGINS:-}
       GLANCEVAULT_PORT: "8080"
       GLANCEVAULT_STORAGE_PATH: /data/glancevault.db
+      # Optional: auth model, "shared" (default) or "per-account". Leave unset
+      # unless you are developing the per-account path — it is not implemented
+      # yet and changes no request handling. See the README.
+      GLANCEVAULT_AUTH_MODE: ${GLANCEVAULT_AUTH_MODE:-}
     volumes:
       # Named volume holding the SQLite database file, so it survives restarts.
       # To run as a non-default user (e.g. Unraid's nobody:users, 99:100),

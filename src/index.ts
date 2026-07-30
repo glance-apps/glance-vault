@@ -19,6 +19,18 @@ function main(): void {
     );
   }
 
+  // Selecting "per-account" today buys nothing: the credential store exists but
+  // no issuance, derivation, or rejection is wired up, so requests are still
+  // scoped exactly as in "shared" mode. Say so loudly rather than let an operator
+  // believe they have turned on an enforcement that is not built yet.
+  if (config.authMode === "per-account") {
+    console.warn(
+      "auth: GLANCEVAULT_AUTH_MODE=per-account is set, but per-account " +
+        "enforcement is not implemented yet. Requests are handled exactly as in " +
+        "shared mode. Do not rely on this flag for access control.",
+    );
+  }
+
   const store = new SqliteStore(config.storagePath);
   store.migrate();
 
@@ -31,7 +43,8 @@ function main(): void {
   const server = app.listen(config.port, () => {
     console.log(
       `GLANCEvault ${SERVER_VERSION} listening on port ${config.port} ` +
-        `(schema v${store.schemaVersion()}, storage ${config.storagePath}, ` +
+        `(auth ${config.authMode}, schema v${store.schemaVersion()}, ` +
+        `storage ${config.storagePath}, ` +
         `blobs ${config.blobStorePath}, maxBlob ${config.maxBlobSize}B, ` +
         `reclaim ${config.blobReclaim ? "on" : "off (retain)"})`,
     );
