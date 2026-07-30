@@ -5,6 +5,7 @@ import type { BlobStore } from "./storage/blobstore.js";
 import { DiskBlobStore } from "./storage/disk-blobstore.js";
 import { deviceTokenAuth } from "./middleware/auth.js";
 import { makeScopeResolver } from "./scope.js";
+import { enrollRouter, bootstrapSecretValidator } from "./routes/enroll.js";
 import { cors } from "./middleware/cors.js";
 import { requestLog } from "./middleware/request-log.js";
 import { rateLimit } from "./middleware/rate-limit.js";
@@ -90,6 +91,20 @@ export function buildApp(
   }
 
   app.use(healthRouter(store));
+
+  // Enrollment (Phase 1.2): REGISTERED ONLY IN PER-ACCOUNT MODE, so a
+  // shared-mode server is byte-identical to one where this route does not
+  // exist (unknown-path probes keep today's exact 401/404 behavior). This is
+  // deliberately a registration-level mode branch — the one kind allowed; no
+  // request handler branches on mode. Mounted in the public segment (behind
+  // CORS and the rate limiter, before deviceTokenAuth) because the bootstrap
+  // secret is the route's own authentication, and the router receives ONLY
+  // the narrow CredentialIssuer surface — it structurally cannot reach
+  // account data, credential reads, or the sweeps. loadConfig guarantees
+  // enrollmentSecret is set whenever authMode is "per-account".
+  if (config.authMode === "per-account") {
+    app.use("/enroll", enrollRouter(store, bootstrapSecretValidator(config.enrollmentSecret!)));
+  }
 
   app.use(deviceTokenAuth(config.deviceToken));
 

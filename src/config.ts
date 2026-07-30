@@ -23,9 +23,16 @@ export interface Config {
   storagePath: string;
   // Which auth model the server runs. DEFAULT "shared": byte-for-byte the
   // behavior self-hosters run today. Optional in the type so test config
-  // literals may omit it; loadConfig always resolves a concrete value, and
-  // nothing currently branches on it.
+  // literals may omit it; loadConfig always resolves a concrete value. The
+  // only branch on it is registration-level (buildApp registers /enroll in
+  // per-account mode); no request handler branches on it.
   authMode?: AuthMode;
+  // The admin-configured bootstrap secret a device exchanges for its own
+  // per-device credential at POST /enroll (Phase 1.2). REQUIRED in
+  // per-account mode (fatal at startup when absent, like a missing
+  // deviceToken); ignored in shared mode, where the endpoint is not
+  // registered at all. Generate like the device token: openssl rand -hex 32.
+  enrollmentSecret?: string;
   // TCP port the HTTP server listens on.
   port: number;
   // The single valid device auth token (a shared secret). Required.
@@ -101,6 +108,7 @@ interface FileConfig {
   // Validated against AuthMode in loadConfig, so the file value is typed loosely
   // here (a hand-edited JSON file can hold anything).
   authMode?: string;
+  enrollmentSecret?: string;
   port?: number;
   deviceToken?: string;
   allowedOrigins?: string[];
@@ -195,6 +203,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!deviceToken || deviceToken.trim() === "") {
     throw new Error(
       "No device token configured. Set GLANCEVAULT_DEVICE_TOKEN or deviceToken in the config file.",
+    );
+  }
+
+  // Enrollment bootstrap secret (Phase 1.2). Empty/whitespace counts as unset
+  // (the compose ${VAR:-} passthrough), like AUTH_MODE. Required in
+  // per-account mode: a per-account server with no way to enroll is a
+  // misconfiguration, and refusing to boot beats a silent server whose
+  // /enroll mysteriously cannot work — the same loud-failure philosophy as
+  // the strict AUTH_MODE parsing and the required device token.
+  const enrollmentSecretRaw = env.GLANCEVAULT_ENROLLMENT_SECRET ?? file.enrollmentSecret;
+  const enrollmentSecret =
+    enrollmentSecretRaw !== undefined && enrollmentSecretRaw.trim() !== ""
+      ? enrollmentSecretRaw
+      : undefined;
+  if (authMode === "per-account" && enrollmentSecret === undefined) {
+    throw new Error(
+      "GLANCEVAULT_AUTH_MODE=per-account requires an enrollment secret. " +
+        "Set GLANCEVAULT_ENROLLMENT_SECRET (or enrollmentSecret in the config file); " +
+        "generate one like the device token, e.g. openssl rand -hex 32.",
     );
   }
 
@@ -326,6 +353,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     storagePath,
     authMode,
+    enrollmentSecret,
     port,
     deviceToken,
     allowedOrigins,

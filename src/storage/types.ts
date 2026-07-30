@@ -289,6 +289,30 @@ export interface AccountStore {
   deleteUploadSession(uploadId: string): void;
 }
 
+// The credential-issuance surface (Phase 1.2) — the ONLY storage object the
+// enrollment route receives. Deliberately narrow: the root Store extends this,
+// but the enrollment router's parameter is typed as CredentialIssuer, so
+// inside that handler forAccount, the sweeps, and lifecycle are not
+// expressible — the same compile-time discipline the scoped routers live
+// under, applied to the one route that legitimately predates an account
+// scope. Credential rows are AUTH METADATA (a mapping to an account_id),
+// not account data: inserting one exposes no sync row, salt, intent, blob,
+// or cursor.
+export interface CredentialIssuer {
+  // Persist a freshly minted credential. Insert-only — issuance never
+  // updates or reads existing credentials — and stamps created_at itself,
+  // like every other store-side timestamp. The credentialHash is the
+  // verifier (see src/credentials.ts for the construction); the secret
+  // value itself is never stored. Consumes NO account seq: issuance cannot
+  // perturb sync ordering or tombstone-GC arithmetic.
+  insertCredential(input: {
+    credentialId: string;
+    accountId: string;
+    deviceId: string;
+    credentialHash: string;
+  }): CredentialRecord;
+}
+
 // Thin storage interface — the ROOT store. Request handlers never see this
 // type: they receive an AccountStore from the scope resolver, and this root
 // interface deliberately cannot read or write account data at all except by
@@ -300,7 +324,7 @@ export interface AccountStore {
 //
 // SQLite is the only implementation; a Postgres implementation can be added
 // later by satisfying this same contract without touching any handler code.
-export interface Store {
+export interface Store extends CredentialIssuer {
   // Apply any pending migrations. Safe to call on every boot; a no-op once the
   // database is already at the current schema version.
   migrate(): void;
@@ -351,6 +375,15 @@ export interface Store {
   // accountId comes from the reclaim listing's own rows, never from a caller-
   // supplied request scope. The bytes are removed separately via the BlobStore.
   deleteBlob(accountId: string, blobHash: string): boolean;
+
+  // Look up a credential row by its stored verifier hash, or null. The read
+  // half of the construction src/credentials.ts owns: the enforcement phase
+  // verifies a presented credential as
+  // getCredentialByHash(hashCredential(presented)). Lives on the root Store
+  // (NOT on CredentialIssuer — the enrollment route cannot read credentials,
+  // only insert; and NOT on AccountStore — verification happens in order to
+  // CONSTRUCT an account scope, so it cannot require one).
+  getCredentialByHash(credentialHash: string): CredentialRecord | null;
 
   // Release underlying resources (database handle, etc.).
   close(): void;
