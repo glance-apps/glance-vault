@@ -61,6 +61,23 @@ export function credentialAuth(verifier: CredentialVerifier) {
       return;
     }
 
+    // Revoked (Phase 2.1): rejected with the BYTE-IDENTICAL body the
+    // unrecognized case uses, deliberately. The shipped 1.4b client halts only
+    // on this exact body, the remedy for both conditions is the same
+    // (re-enroll), and distinct wording would leave every pre-2.2 client
+    // retrying forever against revoked credentials. The revoked-vs-unknown
+    // distinction goes to the server log instead: credentialId and deviceId
+    // are opaque; the accountId is stripped, matching the request-log
+    // redaction posture.
+    if (record.revokedAt !== null) {
+      console.warn(
+        `auth: revoked credential presented (credentialId=${record.credentialId}, ` +
+          `deviceId=${record.deviceId}, revokedAt=${record.revokedAt})`,
+      );
+      res.status(401).json({ error: "invalid credential" });
+      return;
+    }
+
     // Like deviceTokenAuth, set nothing on the request object itself; the
     // authenticated identity travels in the WeakMap to the scope resolver.
     authenticated.set(req, record);

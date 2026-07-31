@@ -154,6 +154,31 @@ re-enrolling always mints a fresh credential rather than returning an old one.
 `shared` deployments are unaffected: switching modes is an explicit operator
 decision, and enrolled credentials mean nothing to a `shared`-mode server.
 
+#### Revoking a credential (per-account mode)
+
+Two admin endpoints exist only in `per-account` mode, authenticated with the
+same bootstrap secret as enrollment (holding that secret already grants
+enrollment into any account, so revocation grants strictly less):
+
+```
+# List every credential (active and revoked; verifier hashes are never returned).
+curl -H 'Authorization: Bearer <the bootstrap secret>' \
+  https://vault.example.com/admin/credentials
+
+# Revoke one. Idempotent; a re-revoke keeps the original timestamp.
+curl -X POST -H 'Authorization: Bearer <the bootstrap secret>' \
+  https://vault.example.com/admin/credentials/<credentialId>/revoke
+```
+
+A revoked credential is rejected on its next request, and any live push
+stream it holds is closed (immediately when revoked through this endpoint; a
+revocation written directly to the database is caught by the push stream's
+next heartbeat). Re-enrolling a device also revokes its previous credential
+automatically, so re-enrollment is rotation: the old credential dies when its
+replacement is born. Revocation deletes nothing — account data, the salt, and
+device sync cursors are untouched, and a revoked device re-enrolls with the
+bootstrap secret to resume.
+
 An unrecognized value is rejected at startup rather than quietly falling back,
 so a typo cannot leave you believing an auth model is on when it is not.
 
@@ -292,7 +317,7 @@ curl http://localhost:8080/healthz
 Expected response:
 
 ```json
-{ "status": "ok", "version": "0.1.0", "schemaVersion": 5, "authMode": "shared" }
+{ "status": "ok", "version": "0.1.0", "schemaVersion": 6, "authMode": "shared" }
 ```
 
 `authMode` is the server's configured auth model — `"shared"` or `"per-account"`,

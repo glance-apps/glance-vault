@@ -7,6 +7,7 @@ import { deviceTokenAuth } from "./middleware/auth.js";
 import { makeScopeResolver, ScopeError } from "./scope.js";
 import { credentialAuth } from "./middleware/credential-auth.js";
 import { enrollRouter, bootstrapSecretValidator } from "./routes/enroll.js";
+import { adminRouter, bootstrapAdminGuard } from "./routes/admin.js";
 import { cors } from "./middleware/cors.js";
 import { requestLog } from "./middleware/request-log.js";
 import { rateLimit } from "./middleware/rate-limit.js";
@@ -105,6 +106,18 @@ export function buildApp(
   // enrollmentSecret is set whenever authMode is "per-account".
   if (config.authMode === "per-account") {
     app.use("/enroll", enrollRouter(store, bootstrapSecretValidator(config.enrollmentSecret!)));
+    // Credential administration (Phase 2.1), same gating and mount segment as
+    // /enroll and guarded by the same bootstrap secret (which already grants
+    // enrollment into any account, so revocation grants strictly less — no
+    // new trust level). On a revocation the hub terminates the credential's
+    // live SSE streams immediately; the heartbeat revalidation below is the
+    // backstop for revocations written outside this process.
+    app.use(
+      "/admin",
+      adminRouter(store, bootstrapAdminGuard(config.enrollmentSecret!), (credentialId) =>
+        accountHub.disconnectCredential(credentialId),
+      ),
+    );
   }
 
   // Request auth (Phase 1.3b): a registration-level mode branch, like the
@@ -152,7 +165,27 @@ export function buildApp(
   // Real-time push (nudge-only SSE), authenticated and account-scoped exactly
   // like the routes above. See routes/events.ts for the event shape and the
   // reverse-proxy flush requirement.
-  app.use("/events", eventsRouter(resolveScope, accountHub));
+  // In per-account mode the SSE heartbeat revalidates the stream's credential
+  // each tick (one indexed point read per connection per ~20s; worst case at
+  // the 1024-connection cap is ~51 reads/s), so a revocation from ANY path —
+  // including a direct database write this process never saw — terminates the
+  // stream within one heartbeat. Shared mode passes no revalidator and is
+  // byte-identical to before.
+  app.use(
+    "/events",
+    eventsRouter(
+      resolveScope,
+      accountHub,
+      config.authMode === "per-account"
+        ? {
+            isCredentialActive: (credentialId) => {
+              const record = store.getCredentialById(credentialId);
+              return record !== null && record.revokedAt === null;
+            },
+          }
+        : {},
+    ),
+  );
 
   // The scope-rejection mapper (Phase 1.3b), mounted after every router. It
   // intercepts EXACTLY the resolver's ScopeError throws — the class exists

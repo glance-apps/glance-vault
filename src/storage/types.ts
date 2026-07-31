@@ -152,6 +152,12 @@ export interface CredentialRecord {
   deviceId: string;
   credentialHash: string;
   createdAt: string;
+  // Revocation flag (Phase 2.1). null = active; an ISO timestamp = revoked at
+  // that moment and the credential no longer authenticates. The store reports
+  // this verbatim; the POLICY (reject with the byte-identical "invalid
+  // credential" body) lives in the auth middleware, so the store stays a dumb
+  // reader and a future response-policy change happens in one visible place.
+  revokedAt: string | null;
 }
 
 // The storage interfaces, split along the account boundary (Phase 1.3a).
@@ -299,18 +305,49 @@ export interface AccountStore {
 // not account data: inserting one exposes no sync row, salt, intent, blob,
 // or cursor.
 export interface CredentialIssuer {
-  // Persist a freshly minted credential. Insert-only — issuance never
-  // updates or reads existing credentials — and stamps created_at itself,
-  // like every other store-side timestamp. The credentialHash is the
-  // verifier (see src/credentials.ts for the construction); the secret
-  // value itself is never stored. Consumes NO account seq: issuance cannot
-  // perturb sync ordering or tombstone-GC arithmetic.
-  insertCredential(input: {
+  // Persist a freshly minted credential, SUPERSEDING its predecessors
+  // (Phase 2.1): inside one transaction, stamp revoked_at on any still-active
+  // credential for the same byte-exact (accountId, deviceId), then insert the
+  // fresh row. Re-enrollment is thereby rotation, not accumulation — without
+  // this, every re-enroll leaves a LIVE KEY behind forever (the pre-2.1
+  // orphan leak). The comparison is byte-exact: no trimming or normalization,
+  // matching account/device semantics everywhere else. Stamps created_at
+  // itself, like every other store-side timestamp. The credentialHash is the
+  // verifier (see src/credentials.ts); the secret value itself is never
+  // stored. Consumes NO account seq: issuance cannot perturb sync ordering or
+  // tombstone-GC arithmetic. Returns the new record plus how many
+  // predecessors this issuance revoked.
+  issueCredential(input: {
     credentialId: string;
     accountId: string;
     deviceId: string;
     credentialHash: string;
-  }): CredentialRecord;
+  }): CredentialRecord & { superseded: number };
+}
+
+// The credential-administration surface (Phase 2.1) — the ONLY storage object
+// the admin router receives. Same narrow-interface discipline as
+// CredentialIssuer: the root Store extends this, but the admin router's
+// parameter is typed CredentialAdmin, so inside that handler forAccount, the
+// sweeps, issuance, and lifecycle are not expressible. Credential rows are
+// auth metadata, not account data — the same argument that placed
+// CredentialIssuer on the root store.
+export interface CredentialAdmin {
+  // Every credential row, active and revoked, ordered deterministically
+  // (created_at, then credential_id). Includes rows orphaned by pre-2.1
+  // re-enrollments — those are LIVE KEYS until explicitly revoked, and this
+  // listing is how an operator finds them. The route serializes an explicit
+  // field allowlist; credential_hash is returned here but MUST never leave
+  // the route layer.
+  listCredentials(): CredentialRecord[];
+
+  // Stamp revoked_at on a credential, idempotently: an already-revoked row
+  // keeps its ORIGINAL timestamp (the WHERE clause requires revoked_at IS
+  // NULL, so a re-revoke changes zero rows). Returns the row as stored plus
+  // whether this call did the revoking, or null for an unknown credentialId.
+  // Writes exactly one cell of one row and touches no other table — never
+  // the devices cursor row (see the route for why that is deliberate).
+  revokeCredential(credentialId: string): { record: CredentialRecord; revokedNow: boolean } | null;
 }
 
 // Thin storage interface — the ROOT store. Request handlers never see this
@@ -324,7 +361,7 @@ export interface CredentialIssuer {
 //
 // SQLite is the only implementation; a Postgres implementation can be added
 // later by satisfying this same contract without touching any handler code.
-export interface Store extends CredentialIssuer {
+export interface Store extends CredentialIssuer, CredentialAdmin {
   // Apply any pending migrations. Safe to call on every boot; a no-op once the
   // database is already at the current schema version.
   migrate(): void;
@@ -375,6 +412,12 @@ export interface Store extends CredentialIssuer {
   // accountId comes from the reclaim listing's own rows, never from a caller-
   // supplied request scope. The bytes are removed separately via the BlobStore.
   deleteBlob(accountId: string, blobHash: string): boolean;
+
+  // Look up a credential row by its credential_id, or null. Auth metadata
+  // read (Phase 2.1): powers the SSE heartbeat revalidation — the events
+  // route holds only a narrow (credentialId) => active? closure built from
+  // this in buildApp — and the admin revoke's read-back.
+  getCredentialById(credentialId: string): CredentialRecord | null;
 
   // Look up a credential row by its stored verifier hash, or null. The read
   // half of the construction src/credentials.ts owns: the enforcement phase

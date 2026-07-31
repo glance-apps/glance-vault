@@ -10,7 +10,9 @@ import type Database from "better-sqlite3";
 // tracking + resumable upload sessions); version 4 adds the nullable
 // sync_rows.deleted_at tombstone timestamp used for client-side tombstone LWW;
 // version 5 adds the per-device credential store, which is STORAGE ONLY at this
-// phase — nothing reads or writes it yet.
+// phase — nothing reads or writes it yet; version 6 adds the nullable
+// device_credentials.revoked_at revocation flag (Phase 2.1) — NULL means
+// active, a timestamp means the credential no longer authenticates.
 //
 // envelope is an opaque BLOB. The server stores and returns these bytes intact
 // and never parses them.
@@ -225,6 +227,21 @@ const MIGRATIONS: Migration[] = [
       -- than one credential at a time is an issuance-policy question the issuing
       -- phase decides, and a unique constraint here would decide it early.
       CREATE INDEX idx_credentials_account ON device_credentials (account_id, device_id);
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      -- Revocation flag (Phase 2.1). NULL = active; an ISO timestamp = revoked
+      -- at that moment. Exactly one nullable column: no revoked_reason, no
+      -- revocation-list table, no token versioning. The check costs nothing at
+      -- request time because the auth middleware already point-reads this row
+      -- on every request; revocation is instant on the next request. Existing
+      -- rows are NOT touched: rows orphaned by pre-2.1 re-enrollments stay
+      -- active (auto-revoking them here would be a data-destructive guess —
+      -- multiple concurrent credentials per device were legal), surfaced
+      -- instead by the admin listing for explicit operator revocation.
+      ALTER TABLE device_credentials ADD COLUMN revoked_at TEXT;
     `,
   },
 ];

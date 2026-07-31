@@ -324,7 +324,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void
 // ======================================================================
 
 function fakeSubscriber(id: number, received: Nudge[]): Subscriber {
-  return { id, deliver: (n) => received.push(n) };
+  return { id, deliver: (n) => received.push(n), close: () => {} };
 }
 
 test("hub delivers a nudge to every connection for the account", () => {
@@ -373,6 +373,7 @@ test("hub publish is best-effort: a throwing connection is dropped, others still
     deliver() {
       throw new Error("dead socket");
     },
+    close: () => {},
   };
   hub.subscribe("acct", bad);
   hub.subscribe("acct", fakeSubscriber(2, good));
