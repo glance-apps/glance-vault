@@ -350,6 +350,89 @@ export interface CredentialAdmin {
   revokeCredential(credentialId: string): { record: CredentialRecord; revokedNow: boolean } | null;
 }
 
+// One account's usage snapshot (Phase 3.1) — DERIVED, CURRENT-STATE aggregates.
+// Nothing here is a lifetime/throughput figure: pruned intents and reclaimed
+// blobs are unrecoverable history, and a counter starting at zero would be
+// worse than none (someone would mistake it for history). Everything below is
+// fully knowable for pre-existing data precisely because it is current state.
+//
+// What counts toward stored bytes (ratified in the 3.1 design):
+//   - TOMBSTONES ARE CHARGED: a soft delete keeps its envelope, and those
+//     bytes cannot be freed while any device cursor sits below the tombstone's
+//     seq (the GC invariant), so treating them as free would let enforcement
+//     build a quota an account physically cannot get back under. The
+//     live/tombstone split is reported so the share is visible.
+//   - RECLAIMABLE-BUT-UNRECLAIMED BLOBS ARE CHARGED: row and bytes exist, and
+//     under the default RETAIN policy may exist forever. (Fairness under
+//     enforcement is a 3.2 consideration, flagged there, not solved here.)
+//   - A blob referenced by many entities is charged ONCE (content-addressed,
+//     stored once per account; ref_count multiplies nothing).
+//   - Staged upload bytes are reported SEPARATELY, never folded into stored:
+//     they are reaper-bounded transfer scratch, and folding them in would make
+//     the headline jitter with every upload.
+//   - storedBytes.intents is the PHYSICAL bytes of rows currently present
+//     (including expired-but-not-yet-pruned); intents.current is the LOGICAL
+//     non-expired count. Physical for bytes, logical for volume.
+//
+// ATTRIBUTION, NOT VOLUME: blob bytes come from blobs.size (the per-account
+// metadata), never from stat-ing the global byte store. If this number ever
+// disagrees with du on the volume, the cause is a transient orphan from a
+// crash between reclaim's byte-delete and row-delete (or reaper scratch) —
+// written down here before it happens.
+export interface AccountUsage {
+  accountId: string;
+  storedBytes: {
+    // sync_rows envelope bytes per app (the split that distinguishes a
+    // lifeGLANCE archive household from a dayGLANCE task user), plus their sum.
+    envelopesByApp: Record<string, number>;
+    envelopes: number;
+    intents: number;
+    blobs: number;
+    total: number;
+  };
+  counts: {
+    rows: number;
+    liveRows: number;
+    tombstones: number;
+    blobs: number;
+  };
+  intents: {
+    // Current non-expired events. CURRENT STATE, NOT THROUGHPUT.
+    current: number;
+  };
+  uploads: {
+    sessions: number; // = concurrent uploads (sessions are reaped when stale)
+    stagedBytes: number;
+  };
+}
+
+// The usage-reporting surface (Phase 3.1) — read-only, derived, aggregate-only.
+// Same narrow-interface discipline as CredentialIssuer/CredentialAdmin: the
+// admin route holds this and cannot reach forAccount, credentials, or the
+// sweeps. Usage numbers are AGGREGATES ABOUT account data, not account data:
+// no envelope byte, entity id, blob hash, or plaintext-adjacent value crosses
+// this surface.
+//
+// Derived on read, deliberately: maintained counters would need delta
+// accounting inside batchUpsert, softDeleteRow, intent insert, both prune
+// paths, blob insert, and reclaim — new read-modify-write patterns adjacent to
+// the four seq landmines. Derivation adds ZERO statements to any write
+// transaction and cannot drift. If Phase 3.2's numbers show the one
+// scan-shaped component (envelope bytes) needs a maintained counter for
+// write-path enforcement, it lands BEHIND THIS INTERFACE, seeded by one
+// derivation pass — a swap, not a rework.
+export interface UsageReporter {
+  // Usage snapshot for one account (byte-exact accountId, like everything).
+  usageForAccount(accountId: string): AccountUsage;
+
+  // Snapshots for every account that has any footprint in the data tables
+  // (sync rows, intents, blobs, upload sessions, salts, devices, seq), in
+  // deterministic accountId order. An account whose only trace is a
+  // credential row has no data footprint and is visible via the credential
+  // listing instead.
+  listUsage(): AccountUsage[];
+}
+
 // Thin storage interface — the ROOT store. Request handlers never see this
 // type: they receive an AccountStore from the scope resolver, and this root
 // interface deliberately cannot read or write account data at all except by
@@ -361,7 +444,7 @@ export interface CredentialAdmin {
 //
 // SQLite is the only implementation; a Postgres implementation can be added
 // later by satisfying this same contract without touching any handler code.
-export interface Store extends CredentialIssuer, CredentialAdmin {
+export interface Store extends CredentialIssuer, CredentialAdmin, UsageReporter {
   // Apply any pending migrations. Safe to call on every boot; a no-op once the
   // database is already at the current schema version.
   migrate(): void;

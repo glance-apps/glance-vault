@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import type {
   Store,
   AccountStore,
+  AccountUsage,
   CredentialRecord,
   SyncRowInput,
   SyncRowRecord,
@@ -827,6 +828,109 @@ export class SqliteStore implements Store {
       return null;
     }
     return { record, revokedNow: info.changes > 0 };
+  }
+
+  // --- Usage reporting (Phase 3.1) — derived, read-only, aggregate-only ---
+  //
+  // Every method here is SELECT-only aggregates: nothing below opens a write
+  // transaction, calls nextSeq, or adds a statement to any write path. That is
+  // the phase's design: derived numbers cannot drift and add zero write-path
+  // cost. The four seq landmines are untouched by construction.
+
+  usageForAccount(accountId: string): AccountUsage {
+    // Envelope bytes + row counts per app in one pass over the account's sync
+    // rows (LENGTH() needs the row, so this is the one scan-shaped
+    // derivation; it runs on an admin read, never on a write).
+    const appRows = this.db
+      .prepare(
+        `SELECT app,
+                COALESCE(SUM(LENGTH(envelope)), 0) AS bytes,
+                COUNT(*) AS rows,
+                COALESCE(SUM(deleted), 0) AS tombstones
+         FROM sync_rows WHERE account_id = ? GROUP BY app ORDER BY app`,
+      )
+      .all(accountId) as { app: string; bytes: number; rows: number; tombstones: number }[];
+
+    const envelopesByApp: Record<string, number> = {};
+    let envelopes = 0;
+    let rows = 0;
+    let tombstones = 0;
+    for (const r of appRows) {
+      envelopesByApp[r.app] = r.bytes;
+      envelopes += r.bytes;
+      rows += r.rows;
+      tombstones += r.tombstones;
+    }
+
+    // Intents: PHYSICAL bytes of rows present (incl. expired-but-unpruned),
+    // LOGICAL current count (non-expired only).
+    const intents = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(LENGTH(envelope)), 0) AS bytes,
+                COALESCE(SUM(expires_at > ?), 0) AS current
+         FROM intent_events WHERE account_id = ?`,
+      )
+      .get(new Date().toISOString(), accountId) as { bytes: number; current: number };
+
+    // Blob bytes from metadata (attribution, not volume — see AccountUsage).
+    const blobs = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(size), 0) AS bytes, COUNT(*) AS count
+         FROM blobs WHERE account_id = ?`,
+      )
+      .get(accountId) as { bytes: number; count: number };
+
+    // In-flight staging: sessions are the live concurrency (reaper-bounded),
+    // staged part bytes reported separately from stored.
+    const uploads = this.db
+      .prepare(
+        `SELECT COUNT(*) AS sessions FROM blob_upload_sessions WHERE account_id = ?`,
+      )
+      .get(accountId) as { sessions: number };
+    const staged = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(p.size), 0) AS bytes
+         FROM blob_upload_parts p
+         JOIN blob_upload_sessions s ON s.upload_id = p.upload_id
+         WHERE s.account_id = ?`,
+      )
+      .get(accountId) as { bytes: number };
+
+    return {
+      accountId,
+      storedBytes: {
+        envelopesByApp,
+        envelopes,
+        intents: intents.bytes,
+        blobs: blobs.bytes,
+        total: envelopes + intents.bytes + blobs.bytes,
+      },
+      counts: {
+        rows,
+        liveRows: rows - tombstones,
+        tombstones,
+        blobs: blobs.count,
+      },
+      intents: { current: intents.current },
+      uploads: { sessions: uploads.sessions, stagedBytes: staged.bytes },
+    };
+  }
+
+  listUsage(): AccountUsage[] {
+    const accounts = this.db
+      .prepare(
+        `SELECT DISTINCT account_id FROM (
+           SELECT account_id FROM sync_rows
+           UNION SELECT account_id FROM intent_events
+           UNION SELECT account_id FROM blobs
+           UNION SELECT account_id FROM blob_upload_sessions
+           UNION SELECT account_id FROM account_salts
+           UNION SELECT account_id FROM devices
+           UNION SELECT account_id FROM account_seq
+         ) ORDER BY account_id`,
+      )
+      .all() as { account_id: string }[];
+    return accounts.map((a) => this.usageForAccount(a.account_id));
   }
 
   // The one gateway to account-scoped data (Phase 1.3a). Returns a STATELESS

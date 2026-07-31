@@ -179,6 +179,22 @@ replacement is born. Revocation deletes nothing — account data, the salt, and
 device sync cursors are untouched, and a revoked device re-enrolls with the
 bootstrap secret to resume.
 
+#### Usage accounting (per-account mode)
+
+`GET /admin/usage` (same bootstrap-secret auth) reports per-account usage plus
+a global rollup: stored bytes (sync envelopes split per app, intent envelopes,
+blob bytes), row counts split live/tombstone, current non-expired intents,
+in-flight upload sessions with their staged bytes (reported separately from
+stored), and live push connections. The numbers are **derived current state**,
+computed on read — record-only, nothing is enforced. Two properties worth
+knowing: tombstones and not-yet-reclaimed blobs are charged to the account
+(they occupy real disk the account cannot free on demand), and blob bytes are
+**attribution, not volume** — they come from per-account metadata, not from
+stat-ing the blob directory, so a transient orphan left by a crash mid-reclaim
+(or reaper-bounded upload scratch) can make `du` read slightly higher.
+Shared-mode deployments don't get this endpoint; `du` on the data volume
+serves a single-household instance.
+
 An unrecognized value is rejected at startup rather than quietly falling back,
 so a typo cannot leave you believing an auth model is on when it is not.
 
