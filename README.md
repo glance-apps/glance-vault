@@ -292,8 +292,13 @@ curl http://localhost:8080/healthz
 Expected response:
 
 ```json
-{ "status": "ok", "version": "0.1.0", "schemaVersion": 5 }
+{ "status": "ok", "version": "0.1.0", "schemaVersion": 5, "authMode": "shared" }
 ```
+
+`authMode` is the server's configured auth model — `"shared"` or `"per-account"`,
+the same strings as `GLANCEVAULT_AUTH_MODE` — so a client can discover which
+setup flow a server needs before enrolling. The endpoint stays public and needs
+no token in either mode.
 
 ## Sync transport endpoints
 
