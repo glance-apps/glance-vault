@@ -70,6 +70,13 @@ export interface AccountHub {
   // Live connection count for one account (0 when none). Introspection for
   // tests and future metrics.
   connectionCount(accountId: string): number;
+
+  // Every account with at least one live connection, with its count, in
+  // deterministic accountId order (Phase 3.1 usage reporting). Introspection
+  // only. NOTE: per-process by nature — under multiple replicas each replica
+  // reports its own connections; this is the one usage dimension that would
+  // need a shared registry (or scrape-and-sum) in a multi-replica deployment.
+  connectionCounts(): { accountId: string; connections: number }[];
   // Total live connections across all accounts. Introspection.
   totalConnections(): number;
 }
@@ -185,6 +192,12 @@ export class InProcessAccountHub implements AccountHub {
 
   connectionCount(accountId: string): number {
     return this.byAccount.get(accountId)?.size ?? 0;
+  }
+
+  connectionCounts(): { accountId: string; connections: number }[] {
+    return [...this.byAccount.entries()]
+      .map(([accountId, set]) => ({ accountId, connections: set.size }))
+      .sort((a, b) => (a.accountId < b.accountId ? -1 : a.accountId > b.accountId ? 1 : 0));
   }
 
   totalConnections(): number {

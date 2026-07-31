@@ -114,8 +114,12 @@ export function buildApp(
     // backstop for revocations written outside this process.
     app.use(
       "/admin",
-      adminRouter(store, bootstrapAdminGuard(config.enrollmentSecret!), (credentialId) =>
-        accountHub.disconnectCredential(credentialId),
+      adminRouter(
+        store,
+        store,
+        bootstrapAdminGuard(config.enrollmentSecret!),
+        (credentialId) => accountHub.disconnectCredential(credentialId),
+        () => accountHub.connectionCounts(),
       ),
     );
   }

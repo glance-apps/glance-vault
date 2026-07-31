@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import type { CredentialAdmin } from "../storage/types.js";
+import type { CredentialAdmin, UsageReporter } from "../storage/types.js";
 import { timingSafeStringEqual } from "../middleware/auth.js";
 
 // Credential administration (Phase 2.1): how an operator actually revokes.
@@ -55,12 +55,22 @@ function serializeCredential(record: {
 
 export function adminRouter(
   admin: CredentialAdmin,
+  // Usage reporting (Phase 3.1): read-only derived aggregates. Passed as its
+  // own narrow surface — this router can list/revoke credentials and read
+  // usage aggregates, and can reach nothing else (no forAccount, no issuance,
+  // no sweeps). Usage numbers are aggregates ABOUT account data, not account
+  // data: no envelope byte, entity id, blob hash, or plaintext-adjacent value
+  // crosses this surface.
+  usage: UsageReporter,
   authorize: AdminGuard,
   // Called after a revocation is durably stamped, with the revoked
   // credentialId. buildApp wires this to hub.disconnectCredential so live SSE
   // streams for the credential terminate immediately (the in-process path;
   // the heartbeat revalidation covers every other path).
   onRevoked: (credentialId: string) => void,
+  // Live SSE connection counts from the hub (per-process by nature — the one
+  // usage dimension a multi-replica deployment would need to rethink).
+  sseCounts: () => { accountId: string; connections: number }[],
 ): Router {
   const router = Router();
 
@@ -107,6 +117,61 @@ export function adminRouter(
       ...serializeCredential(result.record),
       revokedNow: result.revokedNow,
     });
+  });
+
+  // GET /admin/usage — per-account usage snapshots plus a global rollup.
+  // DERIVED CURRENT STATE, never throughput (pruned intents and reclaimed
+  // blobs are unrecoverable history, deliberately not reported), and
+  // ATTRIBUTION, never volume (blob bytes come from per-account metadata,
+  // not from stat-ing the global byte store — a disagreement with du on the
+  // volume means a transient orphan from a crash between reclaim's
+  // byte-delete and row-delete, or reaper-bounded staging scratch).
+  //
+  // Accounts are the union of data-table footprints and live SSE
+  // subscriptions; a connection-only account reports zero storage. This is
+  // the surface the launch-quota decision reads; Phase 3.2's enforcement
+  // reads the same numbers in-process through the UsageReporter store
+  // surface, never through HTTP.
+  router.get("/usage", (_req: Request, res: Response) => {
+    const usageRows = usage.listUsage();
+    const sse = new Map(sseCounts().map((c) => [c.accountId, c.connections]));
+
+    // Merge: every data account, plus any SSE-only account (byte-exact ids).
+    const byAccount = new Map(usageRows.map((u) => [u.accountId, u]));
+    for (const accountId of sse.keys()) {
+      if (!byAccount.has(accountId)) {
+        byAccount.set(accountId, usage.usageForAccount(accountId));
+      }
+    }
+    const accounts = [...byAccount.keys()].sort().map((accountId) => {
+      const u = byAccount.get(accountId)!;
+      return { ...u, sse: { connections: sse.get(accountId) ?? 0 } };
+    });
+
+    const totals = accounts.reduce(
+      (t, a) => ({
+        storedBytes: t.storedBytes + a.storedBytes.total,
+        blobBytes: t.blobBytes + a.storedBytes.blobs,
+        envelopeBytes: t.envelopeBytes + a.storedBytes.envelopes + a.storedBytes.intents,
+        rows: t.rows + a.counts.rows,
+        blobs: t.blobs + a.counts.blobs,
+        uploadSessions: t.uploadSessions + a.uploads.sessions,
+        stagedBytes: t.stagedBytes + a.uploads.stagedBytes,
+        sseConnections: t.sseConnections + a.sse.connections,
+      }),
+      {
+        storedBytes: 0,
+        blobBytes: 0,
+        envelopeBytes: 0,
+        rows: 0,
+        blobs: 0,
+        uploadSessions: 0,
+        stagedBytes: 0,
+        sseConnections: 0,
+      },
+    );
+
+    res.status(200).json({ accounts, totals });
   });
 
   return router;
