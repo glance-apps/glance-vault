@@ -152,6 +152,8 @@ test("device_credentials maps a credential to an account without becoming one", 
       "device_id",
       "credential_hash",
       "created_at",
+      // Added by migration v6 (Phase 2.1): NULL = active, timestamp = revoked.
+      "revoked_at",
     ]);
 
     const insert = db.prepare(

@@ -34,7 +34,16 @@ export type Emit = (accountId: string, nudge: Nudge) => void;
 // propagate back to a writer calling publish().
 export interface Subscriber {
   readonly id: number;
+  // The credential this connection authenticated with (Phase 2.1), so
+  // revocation can find and terminate its stream. undefined in shared mode,
+  // where connections have no credential identity.
+  readonly credentialId?: string;
   deliver(nudge: Nudge): void;
+  // Server-initiated close (Phase 2.1): end the underlying response. Called by
+  // disconnectCredential AFTER the subscriber is removed from the registry, so
+  // a throwing close can never leave a zombie registration. Must be safe to
+  // call on an already-ended response.
+  close(): void;
 }
 
 export interface AccountHub {
@@ -50,6 +59,14 @@ export interface AccountHub {
   // non-blocking: it never throws, and a connection whose deliver() throws is
   // dropped rather than propagated. A no-op when the account has no connections.
   publish(accountId: string, nudge: Nudge): void;
+  // Terminate every connection authenticated by this credential (Phase 2.1):
+  // remove each matching subscriber from the registry, then close its stream.
+  // Returns the number of connections closed. Idempotent — a credential with
+  // no live connections is a harmless zero. Called by the admin revoke path;
+  // the SSE heartbeat revalidation is the backstop for revocations written
+  // outside this process.
+  disconnectCredential(credentialId: string): number;
+
   // Live connection count for one account (0 when none). Introspection for
   // tests and future metrics.
   connectionCount(accountId: string): number;
@@ -141,6 +158,29 @@ export class InProcessAccountHub implements AccountHub {
         this.unsubscribe(accountId, sub);
       }
     }
+  }
+
+  disconnectCredential(credentialId: string): number {
+    let closed = 0;
+    // Snapshot both levels, same discipline as publish: eviction mid-iteration
+    // must not upset the walk, and a throwing close() must not abort the rest.
+    for (const [accountId, set] of [...this.byAccount.entries()]) {
+      for (const sub of [...set]) {
+        if (sub.credentialId !== credentialId) {
+          continue;
+        }
+        // Unsubscribe FIRST so a throw from close() cannot leave the dead
+        // subscriber registered, then end the stream best-effort.
+        this.unsubscribe(accountId, sub);
+        try {
+          sub.close();
+        } catch {
+          // The socket was already gone; removal was the part that mattered.
+        }
+        closed += 1;
+      }
+    }
+    return closed;
   }
 
   connectionCount(accountId: string): number {

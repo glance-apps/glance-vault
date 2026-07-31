@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import type { AccountHub, Nudge, Subscriber } from "../realtime/hub.js";
 import type { ScopeResolver } from "../scope.js";
+import { authenticatedCredential } from "../middleware/credential-auth.js";
 
 // Real-time push endpoint (Phase 9, spec §14). A single authenticated,
 // account-scoped SSE stream. It is mounted after the device-token auth
@@ -59,6 +60,17 @@ export interface EventsOptions {
   // Heartbeat interval in ms. Kept configurable so tests can observe a heartbeat
   // quickly; defaults to a proxy-friendly ~20s in production.
   heartbeatMs?: number;
+  // Revalidation hook (Phase 2.1): "is this credential still active?" —
+  // checked on every heartbeat tick, so a revocation written OUTSIDE this
+  // process (host-side sqlite3 against the mounted volume, a future hosted
+  // panel) still terminates the stream within one heartbeat interval. The
+  // in-process admin revoke evicts immediately via the hub; this is the
+  // backstop that makes revocation airtight regardless of trigger. buildApp
+  // supplies it in per-account mode (one indexed point read per connection
+  // per tick — at the 1024-connection global cap and the 20s default, a worst
+  // case of ~51 reads/second); absent in shared mode, where connections carry
+  // no credential and heartbeat behavior is byte-identical to before.
+  isCredentialActive?: (credentialId: string) => boolean;
 }
 
 export function eventsRouter(resolve: ScopeResolver, hub: AccountHub, opts: EventsOptions = {}): Router {
@@ -82,9 +94,14 @@ export function eventsRouter(resolve: ScopeResolver, hub: AccountHub, opts: Even
     // binding by construction — if they ever keyed on different strings, a
     // subscriber would leak in the hub permanently.
     const boundAccount = scoped.accountId;
+    // The credential this stream authenticated with (Phase 2.1): present in
+    // per-account mode, undefined in shared mode. Captured once at connect —
+    // the same lifetime binding as boundAccount.
+    const credentialId = authenticatedCredential(req)?.credentialId;
 
     const sub: Subscriber = {
       id: nextId++,
+      credentialId,
       deliver(nudge: Nudge) {
         // A dead/closed socket makes this throw (or the response is already
         // ended); let it propagate so the hub evicts this subscriber. Write
@@ -93,6 +110,13 @@ export function eventsRouter(resolve: ScopeResolver, hub: AccountHub, opts: Even
           throw new Error("SSE response already ended");
         }
         res.write(frame("activity", nudge));
+      },
+      close() {
+        // Server-initiated termination (hub.disconnectCredential). The hub
+        // has already unsubscribed this record; ending the response fires the
+        // res 'close' event, whose cleanup() is idempotent and stops the
+        // heartbeat. Safe on an already-ended response.
+        res.end();
       },
     };
 
@@ -137,6 +161,26 @@ export function eventsRouter(resolve: ScopeResolver, hub: AccountHub, opts: Even
       if (res.writableEnded) {
         cleanup();
         return;
+      }
+      // Revalidate before keeping the stream alive (Phase 2.1): a credential
+      // revoked since connect — by any path, including a database write this
+      // process never saw — ends the stream here instead of being heartbeated
+      // indefinitely. The disconnected client reconnects, connect returns 401
+      // invalid credential, and the shipped client's halt fires: revocation
+      // reaches live streams with no client change.
+      if (credentialId !== undefined && opts.isCredentialActive !== undefined) {
+        let active = true;
+        try {
+          active = opts.isCredentialActive(credentialId);
+        } catch {
+          // A transient storage error must not kill a healthy stream; the
+          // next tick re-checks.
+        }
+        if (!active) {
+          cleanup();
+          res.end();
+          return;
+        }
       }
       try {
         res.write(": heartbeat\n\n");

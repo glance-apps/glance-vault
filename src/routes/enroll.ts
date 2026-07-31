@@ -83,9 +83,12 @@ export function enrollRouter(issuer: CredentialIssuer, validate: EnrollmentValid
       return;
     }
 
-    // Steps 2–4: mint fresh, persist the hash, return the value once.
+    // Steps 2–4: mint fresh, persist the hash (superseding any still-active
+    // predecessor for this byte-exact (accountId, deviceId) — Phase 2.1 turns
+    // re-enrollment into rotation, so a lost device's old credential dies the
+    // moment its replacement is born), return the value once.
     const minted = mintCredential();
-    const record = issuer.insertCredential({
+    const record = issuer.issueCredential({
       credentialId: minted.credentialId,
       accountId: body.accountId,
       deviceId: body.deviceId,

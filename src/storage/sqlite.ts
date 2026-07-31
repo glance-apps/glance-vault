@@ -111,6 +111,27 @@ function toBlobRecord(row: BlobRowDb): BlobRecord {
   };
 }
 
+// Shape of a device_credentials row as it comes back from better-sqlite3.
+interface CredentialRowDb {
+  credential_id: string;
+  account_id: string;
+  device_id: string;
+  credential_hash: string;
+  created_at: string;
+  revoked_at: string | null;
+}
+
+function toCredentialRecord(row: CredentialRowDb): CredentialRecord {
+  return {
+    credentialId: row.credential_id,
+    accountId: row.account_id,
+    deviceId: row.device_id,
+    credentialHash: row.credential_hash,
+    createdAt: row.created_at,
+    revokedAt: row.revoked_at ?? null,
+  };
+}
+
 // SQLite-backed Store. SQLite serializes all writes through a single writer, so
 // a per-account counter bumped inside a transaction is naturally monotonic.
 // WAL mode plus a busy timeout lets multiple connections (or processes sharing
@@ -713,56 +734,99 @@ export class SqliteStore implements Store {
     return info.changes > 0;
   }
 
-  // --- Credentials (Phase 1.2) — root-level auth metadata, not account data ---
+  // --- Credentials (Phases 1.2 + 2.1) — root-level auth metadata, not account data ---
 
-  // Insert-only persistence of a freshly minted credential. No read, no
-  // upsert: enrollment always mints fresh (non-idempotent by design), and the
-  // UNIQUE index on credential_hash makes an astronomically-unlikely verifier
-  // collision a loud constraint error rather than a silent overwrite. Consumes
-  // no account seq and touches no other table.
-  insertCredential(input: {
+  // Persist a freshly minted credential, superseding predecessors (Phase
+  // 2.1): one transaction stamps revoked_at on every still-active credential
+  // for the same byte-exact (account_id, device_id), then inserts the fresh
+  // row. Re-enrollment is rotation, not accumulation — the pre-2.1 behavior
+  // left every superseded credential behind as a LIVE KEY. The UNIQUE index
+  // on credential_hash still makes an astronomically-unlikely verifier
+  // collision a loud constraint error. Consumes no account seq, touches no
+  // table but device_credentials, and contains no nextSeq check-then-act —
+  // this transaction is NOT one of the four seq landmines.
+  issueCredential(input: {
     credentialId: string;
     accountId: string;
     deviceId: string;
     credentialHash: string;
-  }): CredentialRecord {
-    const createdAt = new Date().toISOString();
-    this.db
-      .prepare(
-        `INSERT INTO device_credentials
-           (credential_id, account_id, device_id, credential_hash, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(input.credentialId, input.accountId, input.deviceId, input.credentialHash, createdAt);
-    return { ...input, createdAt };
+  }): CredentialRecord & { superseded: number } {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const superseded = this.db
+        .prepare(
+          `UPDATE device_credentials SET revoked_at = ?
+           WHERE account_id = ? AND device_id = ? AND revoked_at IS NULL`,
+        )
+        .run(now, input.accountId, input.deviceId).changes;
+      this.db
+        .prepare(
+          `INSERT INTO device_credentials
+             (credential_id, account_id, device_id, credential_hash, created_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(input.credentialId, input.accountId, input.deviceId, input.credentialHash, now);
+      return { ...input, createdAt: now, revokedAt: null, superseded };
+    });
   }
 
-  // Verifier-hash lookup for the enforcement phase (unique-index point read).
+  // Verifier-hash lookup for the enforcement path (unique-index point read).
+  // Returns the row INCLUDING revoked_at: the store reports, the auth
+  // middleware decides — revoked rows are not filtered here, so the response
+  // policy stays in one visible place.
   getCredentialByHash(credentialHash: string): CredentialRecord | null {
     const row = this.db
       .prepare(
-        `SELECT credential_id, account_id, device_id, credential_hash, created_at
+        `SELECT credential_id, account_id, device_id, credential_hash, created_at, revoked_at
          FROM device_credentials WHERE credential_hash = ?`,
       )
-      .get(credentialHash) as
-      | {
-          credential_id: string;
-          account_id: string;
-          device_id: string;
-          credential_hash: string;
-          created_at: string;
-        }
-      | undefined;
-    if (!row) {
+      .get(credentialHash) as CredentialRowDb | undefined;
+    return row ? toCredentialRecord(row) : null;
+  }
+
+  // credential_id point read (Phase 2.1): powers SSE heartbeat revalidation
+  // and the admin revoke's read-back.
+  getCredentialById(credentialId: string): CredentialRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT credential_id, account_id, device_id, credential_hash, created_at, revoked_at
+         FROM device_credentials WHERE credential_id = ?`,
+      )
+      .get(credentialId) as CredentialRowDb | undefined;
+    return row ? toCredentialRecord(row) : null;
+  }
+
+  // Every credential row, active and revoked, deterministically ordered.
+  listCredentials(): CredentialRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT credential_id, account_id, device_id, credential_hash, created_at, revoked_at
+         FROM device_credentials ORDER BY created_at, credential_id`,
+      )
+      .all() as CredentialRowDb[];
+    return rows.map(toCredentialRecord);
+  }
+
+  // Idempotent revocation: the WHERE revoked_at IS NULL predicate means a
+  // re-revoke changes ZERO rows and the original timestamp survives. Writes
+  // exactly one cell of one row; touches no other table — deliberately never
+  // the devices cursor row (a revoked-then-re-enrolled device returns with
+  // the same package-owned deviceId, and its old cursor is what protects it
+  // from tombstone-GC resurrection during the gap).
+  revokeCredential(
+    credentialId: string,
+  ): { record: CredentialRecord; revokedNow: boolean } | null {
+    const info = this.db
+      .prepare(
+        `UPDATE device_credentials SET revoked_at = ?
+         WHERE credential_id = ? AND revoked_at IS NULL`,
+      )
+      .run(new Date().toISOString(), credentialId);
+    const record = this.getCredentialById(credentialId);
+    if (record === null) {
       return null;
     }
-    return {
-      credentialId: row.credential_id,
-      accountId: row.account_id,
-      deviceId: row.device_id,
-      credentialHash: row.credential_hash,
-      createdAt: row.created_at,
-    };
+    return { record, revokedNow: info.changes > 0 };
   }
 
   // The one gateway to account-scoped data (Phase 1.3a). Returns a STATELESS
