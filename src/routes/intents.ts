@@ -2,6 +2,7 @@ import { Router, json, type Request, type Response } from "express";
 import type { IntentEventInput, IntentEventRecord } from "../storage/types.js";
 import type { Emit } from "../realtime/hub.js";
 import type { ScopeResolver } from "../scope.js";
+import type { QuotaGate } from "../quotas.js";
 
 const DEFAULT_LIMIT = 500;
 const MAX_LIMIT = 1000;
@@ -62,7 +63,9 @@ function normalizeExpiresAt(value: unknown): string | null {
 // source as sync, so this is the same "activity" nudge — a nudged client drains
 // both sync and intents. Post-commit, non-throwing, non-blocking; never gates
 // the write.
-export function intentsRouter(resolve: ScopeResolver, emit: Emit): Router {
+// gate (Phase 3.2): optional intent-volume cap (current non-expired count).
+// 429, and it self-heals as TTLs expire.
+export function intentsRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGate): Router {
   const router = Router();
 
   // Insert a batch of intent events. Body: { accountId, events: [{ eventId,
@@ -112,6 +115,15 @@ export function intentsRouter(resolve: ScopeResolver, emit: Emit): Router {
     }
 
     const scoped = resolve(req, body.accountId);
+
+    if (gate) {
+      const rejected = gate.admitIntents(scoped.accountId, events.length);
+      if (rejected) {
+        res.status(rejected.status).json(rejected.body);
+        return;
+      }
+    }
+
     const result = scoped.insertIntents(events);
     // A landed intent is always CONTENT — an insert-only cross-device message
     // another device must pull — never bookkeeping, so it nudges unconditionally

@@ -61,6 +61,11 @@ built-in defaults.
 | Rate-limit window (s) | `GLANCEVAULT_RATE_LIMIT_WINDOW_SECONDS` | `rateLimitWindowSeconds` | 60 |
 | Rate-limit max/window | `GLANCEVAULT_RATE_LIMIT_MAX` | `rateLimitMax` | 600 |
 | Max SSE connections (total) | `GLANCEVAULT_MAX_SSE_CONNECTIONS` | `maxSseConnections` | 1024 |
+| Storage quota per account (MiB) | `GLANCEVAULT_QUOTA_STORAGE_MB` | `quotaStorageMb` | unset (no limit) |
+| Row quota per account | `GLANCEVAULT_QUOTA_ROWS` | `quotaRows` | unset (no limit) |
+| Intent quota per account | `GLANCEVAULT_QUOTA_INTENTS` | `quotaIntents` | unset (no limit) |
+| Concurrent-upload quota per account | `GLANCEVAULT_QUOTA_UPLOADS` | `quotaUploads` | unset (no limit) |
+| SSE connections per account | `GLANCEVAULT_QUOTA_SSE_PER_ACCOUNT` | `quotaSsePerAccount` | 64 (existing cap) |
 | Upload-session TTL (h) | `GLANCEVAULT_UPLOAD_SESSION_TTL_HOURS` | `uploadSessionTtlHours` | 24 |
 | Upload-session sweep (min) | `GLANCEVAULT_UPLOAD_SESSION_SWEEP_MINUTES` | `uploadSessionSweepMinutes` | 60 |
 
@@ -194,6 +199,51 @@ stat-ing the blob directory, so a transient orphan left by a crash mid-reclaim
 (or reaper-bounded upload scratch) can make `du` read slightly higher.
 Shared-mode deployments don't get this endpoint; `du` on the data volume
 serves a single-household instance.
+
+### Per-account quotas (optional)
+
+All quotas are **unset by default: an unconfigured server enforces nothing and
+behaves exactly as before.** When set, a limit applies to every account.
+
+The storage quota gates **blob bytes only** (stored blobs plus in-flight upload
+reservations), checked when an upload starts — before any byte moves — and
+rejected with `413 {"error":"quota exceeded","quota":"storage",limit,used,requested}`.
+Sync writes, deletes, cursor reports, the salt, reference releases, and
+re-uploads of already-stored blobs are **never** quota-gated, so an over-quota
+account keeps working in every way except adding new media. Envelope (text)
+bytes are reported by `/admin/usage` but deliberately not enforced; the row
+quota is the coarse backstop if you need one (it blocks only *new* entities,
+never updates or deletes). The intent and concurrent-upload quotas return
+`429` with the same body shape (`"quota":"intents"` / `"concurrent-uploads"`).
+A client can free a stuck upload reservation immediately with
+`DELETE /blobs/uploads/<uploadId>?accountId=...`; abandoned sessions are also
+swept by the 24-hour reaper.
+
+**Getting back under a storage quota is an operator action.** Nothing a user
+does reduces measured usage on a default-configured server: deletes keep their
+envelopes until sync GC exists, and released blobs are kept under the RETAIN
+default. Either raise the quota (config change + restart), or enable blob
+reclaim (`GLANCEVAULT_BLOB_RECLAIM=on`) so released media is actually collected
+after the grace window. An account already over a newly set quota is not
+broken — it simply cannot add new blob bytes until one of those happens.
+
+**The suggested numbers below are illustrative placeholders, not
+recommendations.** Size the storage quota against your actual disk before it
+means anything — e.g. 20 GiB per account on an 80 GB host is only three
+accounts. The real number is a business decision.
+
+```
+# Placeholders — size against real disk and real usage (/admin/usage):
+# GLANCEVAULT_QUOTA_STORAGE_MB=20480     # 20 GiB of blob bytes per account
+# GLANCEVAULT_QUOTA_ROWS=200000
+# GLANCEVAULT_QUOTA_INTENTS=1000
+# GLANCEVAULT_QUOTA_UPLOADS=8
+# GLANCEVAULT_QUOTA_SSE_PER_ACCOUNT=64
+```
+
+In `shared` mode quotas gate the account id the client *claims*, which any
+client can change: they are advisory without per-account identity, and the
+server says so at startup. Real enforcement implies `per-account` mode.
 
 An unrecognized value is rejected at startup rather than quietly falling back,
 so a typo cannot leave you believing an auth model is on when it is not.

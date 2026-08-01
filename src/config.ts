@@ -94,6 +94,25 @@ export interface Config {
   // Process-wide ceiling on total concurrent SSE connections across all accounts
   // (the global backstop the per-account cap does not provide). Default 1024.
   maxSseConnections?: number;
+  // Per-account quotas (Phase 3.2). ALL UNSET BY DEFAULT: when no quota is
+  // configured, no enforcement object is constructed at all and behavior is
+  // byte-identical to a pre-quota server, in both auth modes — nobody
+  // discovers a cap they did not set. When set, limits apply to EVERY account
+  // (per-account overrides are a hosted/billing concern, out of scope).
+  // Storage gates BLOB-ATTRIBUTABLE bytes (stored blobs + in-flight declared
+  // reservations) at the blob path only; envelope bytes are measured by
+  // /admin/usage but deliberately unenforced (Phase 3.2 design). In shared
+  // mode quotas gate the CLAIMED account and are advisory — a client can
+  // evade by renaming; real enforcement implies per-account mode (the server
+  // warns at startup).
+  quotaStorageBytes?: number;
+  quotaRows?: number;
+  quotaIntents?: number;
+  quotaUploads?: number;
+  // Per-account SSE connection cap. This one HAS a default — 64, the constant
+  // the hub has always enforced — so configuring it merely tunes existing
+  // behavior; leaving it unset changes nothing.
+  maxSseConnectionsPerAccount?: number;
   // Stale resumable-upload reaper (Phase 7). An abandoned upload leaves a session
   // row plus staged part bytes on disk; without a reaper they accumulate. A
   // session older than the TTL is swept (staged bytes + row removed). ALWAYS ON
@@ -120,6 +139,11 @@ interface FileConfig {
   blobGracePeriodDays?: number;
   blobDeadDevicePeriodDays?: number;
   blobReclaimIntervalMinutes?: number;
+  quotaStorageMb?: number;
+  quotaRows?: number;
+  quotaIntents?: number;
+  quotaUploads?: number;
+  quotaSsePerAccount?: number;
   requestLog?: boolean;
   trustProxy?: string | number | boolean;
   rateLimit?: boolean;
@@ -335,6 +359,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     "GLANCEVAULT_MAX_SSE_CONNECTIONS",
   );
 
+  // Quotas (Phase 3.2). Absent = unlimited = no gate constructed. The
+  // storage quota arrives in operator-friendly MiB and is normalized to bytes.
+  const quotaStorageBytes = resolveOptionalCount(
+    env.GLANCEVAULT_QUOTA_STORAGE_MB,
+    file.quotaStorageMb,
+    "GLANCEVAULT_QUOTA_STORAGE_MB",
+    1024 * 1024,
+  );
+  const quotaRows = resolveOptionalCount(env.GLANCEVAULT_QUOTA_ROWS, file.quotaRows, "GLANCEVAULT_QUOTA_ROWS");
+  const quotaIntents = resolveOptionalCount(
+    env.GLANCEVAULT_QUOTA_INTENTS,
+    file.quotaIntents,
+    "GLANCEVAULT_QUOTA_INTENTS",
+  );
+  const quotaUploads = resolveOptionalCount(
+    env.GLANCEVAULT_QUOTA_UPLOADS,
+    file.quotaUploads,
+    "GLANCEVAULT_QUOTA_UPLOADS",
+  );
+  const maxSseConnectionsPerAccount = resolveOptionalCount(
+    env.GLANCEVAULT_QUOTA_SSE_PER_ACCOUNT,
+    file.quotaSsePerAccount,
+    "GLANCEVAULT_QUOTA_SSE_PER_ACCOUNT",
+  );
+
   const uploadSessionTtlMs = resolveDuration(
     env.GLANCEVAULT_UPLOAD_SESSION_TTL_HOURS,
     file.uploadSessionTtlHours,
@@ -369,9 +418,35 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     rateLimitWindowMs,
     rateLimitMax,
     maxSseConnections,
+    quotaStorageBytes,
+    quotaRows,
+    quotaIntents,
+    quotaUploads,
+    maxSseConnectionsPerAccount,
     uploadSessionTtlMs,
     uploadSessionSweepIntervalMs,
   };
+}
+
+// Resolve an OPTIONAL positive-integer setting: absent everywhere stays
+// undefined (which for quotas means "no limit, no gate"). Same env-over-file
+// precedence and positive-integer validation as resolveCount; unitMultiplier
+// converts operator units (e.g. MiB) to internal units (bytes).
+function resolveOptionalCount(
+  envValue: string | undefined,
+  fileValue: number | undefined,
+  envName: string,
+  unitMultiplier = 1,
+): number | undefined {
+  const raw = envValue !== undefined && envValue.trim() !== "" ? envValue : fileValue != null ? String(fileValue) : undefined;
+  if (raw === undefined) {
+    return undefined;
+  }
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`Invalid ${envName}: ${raw}`);
+  }
+  return n * unitMultiplier;
 }
 
 // Resolve the auth mode. Unlike the on/off flags above (which coerce anything

@@ -36,6 +36,12 @@ services:
       # Required only when GLANCEVAULT_AUTH_MODE=per-account: the bootstrap
       # secret devices exchange for per-device credentials at POST /enroll.
       GLANCEVAULT_ENROLLMENT_SECRET: ${GLANCEVAULT_ENROLLMENT_SECRET:-}
+      # Optional per-account quotas (unset = no enforcement). See .env.example.
+      GLANCEVAULT_QUOTA_STORAGE_MB: ${GLANCEVAULT_QUOTA_STORAGE_MB:-}
+      GLANCEVAULT_QUOTA_ROWS: ${GLANCEVAULT_QUOTA_ROWS:-}
+      GLANCEVAULT_QUOTA_INTENTS: ${GLANCEVAULT_QUOTA_INTENTS:-}
+      GLANCEVAULT_QUOTA_UPLOADS: ${GLANCEVAULT_QUOTA_UPLOADS:-}
+      GLANCEVAULT_QUOTA_SSE_PER_ACCOUNT: ${GLANCEVAULT_QUOTA_SSE_PER_ACCOUNT:-}
     volumes:
       # Named volume holding the SQLite database file, so it survives restarts.
       # To run as a non-default user (e.g. Unraid's nobody:users, 99:100),

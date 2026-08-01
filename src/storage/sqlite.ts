@@ -933,6 +933,54 @@ export class SqliteStore implements Store {
     return accounts.map((a) => this.usageForAccount(a.account_id));
   }
 
+  // --- Quota admission reads (Phase 3.2) — SELECT-only indexed aggregates ---
+  // Like the usage reporting above: nothing here opens a transaction, calls
+  // nextSeq, or adds a statement to any write path.
+
+  blobFootprint(accountId: string): { blobBytes: number; sessionCount: number; declaredBytes: number } {
+    const blobs = this.db
+      .prepare(`SELECT COALESCE(SUM(size), 0) AS bytes FROM blobs WHERE account_id = ?`)
+      .get(accountId) as { bytes: number };
+    const sessions = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count, COALESCE(SUM(declared_size), 0) AS declared
+         FROM blob_upload_sessions WHERE account_id = ?`,
+      )
+      .get(accountId) as { count: number; declared: number };
+    return { blobBytes: blobs.bytes, sessionCount: sessions.count, declaredBytes: sessions.declared };
+  }
+
+  syncRowCount(accountId: string): number {
+    return (
+      this.db.prepare(`SELECT COUNT(*) AS n FROM sync_rows WHERE account_id = ?`).get(accountId) as {
+        n: number;
+      }
+    ).n;
+  }
+
+  countExistingEntities(app: string, accountId: string, entityIds: string[]): number {
+    if (entityIds.length === 0) {
+      return 0;
+    }
+    const placeholders = entityIds.map(() => "?").join(",");
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM sync_rows
+           WHERE account_id = ? AND app = ? AND entity_id IN (${placeholders})`,
+        )
+        .get(accountId, app, ...entityIds) as { n: number }
+    ).n;
+  }
+
+  intentCount(accountId: string): number {
+    return (
+      this.db
+        .prepare(`SELECT COUNT(*) AS n FROM intent_events WHERE account_id = ? AND expires_at > ?`)
+        .get(accountId, new Date().toISOString()) as { n: number }
+    ).n;
+  }
+
   // The one gateway to account-scoped data (Phase 1.3a). Returns a STATELESS
   // parameter binder: every method simply calls the corresponding private
   // method with accountId pre-bound. No cache, no cursor, no transaction state
