@@ -958,19 +958,47 @@ export class SqliteStore implements Store {
     ).n;
   }
 
+  // Both IN(...) probes below run in CHUNKS: SQLite caps bound variables
+  // (32766 here, 999 on older builds), and a single sync batch can legally
+  // carry more ids than that — the 16 MB body limit admits ~100k tiny rows.
+  // One oversized IN() would throw "too many SQL variables" and turn a batch
+  // that deserves a clean 413/200 into a 500. 900 per chunk stays under even
+  // the oldest limit; the probe is the same indexed point-lookup count either
+  // way, just issued in slices.
+  private static readonly IN_CHUNK = 900;
+
   countExistingEntities(app: string, accountId: string, entityIds: string[]): number {
-    if (entityIds.length === 0) {
-      return 0;
+    let n = 0;
+    for (let i = 0; i < entityIds.length; i += SqliteStore.IN_CHUNK) {
+      const chunk = entityIds.slice(i, i + SqliteStore.IN_CHUNK);
+      const placeholders = chunk.map(() => "?").join(",");
+      n += (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM sync_rows
+             WHERE account_id = ? AND app = ? AND entity_id IN (${placeholders})`,
+          )
+          .get(accountId, app, ...chunk) as { n: number }
+      ).n;
     }
-    const placeholders = entityIds.map(() => "?").join(",");
-    return (
-      this.db
-        .prepare(
-          `SELECT COUNT(*) AS n FROM sync_rows
-           WHERE account_id = ? AND app = ? AND entity_id IN (${placeholders})`,
-        )
-        .get(accountId, app, ...entityIds) as { n: number }
-    ).n;
+    return n;
+  }
+
+  countExistingIntentEvents(accountId: string, eventIds: string[]): number {
+    let n = 0;
+    for (let i = 0; i < eventIds.length; i += SqliteStore.IN_CHUNK) {
+      const chunk = eventIds.slice(i, i + SqliteStore.IN_CHUNK);
+      const placeholders = chunk.map(() => "?").join(",");
+      n += (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM intent_events
+             WHERE account_id = ? AND event_id IN (${placeholders})`,
+          )
+          .get(accountId, ...chunk) as { n: number }
+      ).n;
+    }
+    return n;
   }
 
   intentCount(accountId: string): number {

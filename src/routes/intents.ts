@@ -63,8 +63,9 @@ function normalizeExpiresAt(value: unknown): string | null {
 // source as sync, so this is the same "activity" nudge — a nudged client drains
 // both sync and intents. Post-commit, non-throwing, non-blocking; never gates
 // the write.
-// gate (Phase 3.2): optional intent-volume cap (current non-expired count).
-// 429, and it self-heals as TTLs expire.
+// gate (Phase 3.2): optional intent-volume cap (current non-expired count),
+// NET-NEW eventIds only — a re-send of already-stored events is a no-op write
+// and is never rejected. 429, and it self-heals as TTLs expire.
 export function intentsRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGate): Router {
   const router = Router();
 
@@ -116,8 +117,11 @@ export function intentsRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGa
 
     const scoped = resolve(req, body.accountId);
 
+    // Gate on eventIds, not batch size: the gate discounts re-sent ids (the
+    // write below is insert-only), so an idempotent retry of an already-
+    // delivered batch is never rejected at the cap.
     if (gate) {
-      const rejected = gate.admitIntents(scoped.accountId, events.length);
+      const rejected = gate.admitIntents(scoped.accountId, events.map((e) => e.eventId));
       if (rejected) {
         res.status(rejected.status).json(rejected.body);
         return;

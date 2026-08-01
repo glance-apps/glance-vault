@@ -214,7 +214,9 @@ account keeps working in every way except adding new media. Envelope (text)
 bytes are reported by `/admin/usage` but deliberately not enforced; the row
 quota is the coarse backstop if you need one (it blocks only *new* entities,
 never updates or deletes). The intent and concurrent-upload quotas return
-`429` with the same body shape (`"quota":"intents"` / `"concurrent-uploads"`).
+`429` with the same body shape (`"quota":"intents"` / `"concurrent-uploads"`);
+like the row quota, the intent quota counts only *new* event ids, so a client
+retrying an already-delivered batch is never rejected.
 A client can free a stuck upload reservation immediately with
 `DELETE /blobs/uploads/<uploadId>?accountId=...`; abandoned sessions are also
 swept by the 24-hour reaper.
