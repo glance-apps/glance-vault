@@ -1,6 +1,7 @@
 import { Router, json, raw, type Request, type Response } from "express";
 import { createHash, randomUUID } from "node:crypto";
 import type { ScopeResolver } from "../scope.js";
+import type { QuotaGate } from "../quotas.js";
 
 // A blob hash is the lowercase hex SHA-256 of the ciphertext: 64 hex chars. The
 // server recomputes this exact function over the reassembled bytes on finalize
@@ -91,7 +92,12 @@ function parseRange(
 // one call and cannot drift apart. The byte NAMESPACE stays global
 // (content-addressed); what changed is that this file can no longer touch it
 // except through the account's own metadata/session rows.
-export function blobsRouter(resolve: ScopeResolver, maxBlobSize: number): Router {
+// gate (Phase 3.2) is OPTIONAL: undefined when no quota is configured, in
+// which case no code below consults anything — default-off is structural.
+// Checks run after validation and the scope resolve (400s first, then
+// 401/403, then 413/429), and always BEFORE any store write, so a rejection
+// mutates nothing by construction.
+export function blobsRouter(resolve: ScopeResolver, maxBlobSize: number, gate?: QuotaGate): Router {
   const router = Router();
 
   // Raw body for upload parts: any content-type, capped at the max blob size
@@ -138,6 +144,19 @@ export function blobsRouter(resolve: ScopeResolver, maxBlobSize: number): Router
     if (scoped.getBlob(body.blobHash) !== null) {
       res.status(200).json({ exists: true, blobHash: body.blobHash });
       return;
+    }
+
+    // Quota admission (Phase 3.2), AFTER the dedup check above: re-uploading
+    // an already-owned hash adds zero bytes and must succeed even over quota
+    // (client self-heal). The declared size becomes a reservation the moment
+    // the session row is created; check-then-create runs synchronously in one
+    // event-loop turn, so parallel initiates cannot slip past the math.
+    if (gate) {
+      const rejected = gate.admitUpload(scoped.accountId, body.size);
+      if (rejected) {
+        res.status(rejected.status).json(rejected.body);
+        return;
+      }
     }
 
     const uploadId = randomUUID();
@@ -281,12 +300,51 @@ export function blobsRouter(resolve: ScopeResolver, maxBlobSize: number): Router
         return;
       }
 
+      // Finalize belt-and-suspenders (Phase 3.2): only trips when the
+      // operator lowered the limit between initiate and finalize. Staged
+      // bytes and the session are discarded exactly like the hash-mismatch
+      // rejection above — the battle-tested cleanup path.
+      if (gate) {
+        const rejected = gate.admitFinalize(scoped.accountId, assembled.length);
+        if (rejected) {
+          scoped.discardUploadSession(session.uploadId);
+          res.status(rejected.status).json(rejected.body);
+          return;
+        }
+      }
+
       scoped.putBlobBytes(session.blobHash, assembled);
       scoped.insertBlobIfAbsent(session.blobHash, assembled.length);
       scoped.discardUploadSession(session.uploadId);
       res.status(200).json({ blobHash: session.blobHash, size: assembled.length, stored: true });
     },
   );
+
+  // --- Resumable upload: cancel -------------------------------------------------
+  // DELETE /blobs/uploads/:uploadId?accountId=
+  // Client-initiated session cleanup (Phase 3.2). Without this, an
+  // interrupted upload — the ORDINARY flaky-connection case, not an
+  // adversarial one — held its declared-size quota reservation hostage until
+  // the 24h reaper. Discards staged bytes then the session row (the same
+  // ownership-checked, idempotent path finalize's cleanup uses). 404 for a
+  // session this account does not own, like every other session route.
+  // Deliberately NOT quota-gated: cancelling is how an account RELEASES
+  // reservation, so it must work over quota.
+  router.delete("/uploads/:uploadId", (req: Request, res: Response) => {
+    const accountId = queryAccountId(req);
+    if (accountId === null) {
+      res.status(400).json({ error: "accountId is required" });
+      return;
+    }
+    const scoped = resolve(req, accountId);
+    const session = scoped.getUploadSession(req.params.uploadId);
+    if (session === null) {
+      res.status(404).json({ error: "unknown upload session" });
+      return;
+    }
+    scoped.discardUploadSession(session.uploadId);
+    res.status(200).json({ uploadId: session.uploadId, cancelled: true });
+  });
 
   // --- Reference tracking: add ------------------------------------------------
   // POST /blobs/:hash/ref-add  body: { accountId }

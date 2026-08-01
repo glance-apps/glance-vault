@@ -433,6 +433,33 @@ export interface UsageReporter {
   listUsage(): AccountUsage[];
 }
 
+// Targeted, SELECT-only reads for quota admission (Phase 3.2). Same
+// aggregate-only argument as UsageReporter: no envelope byte, entity id, or
+// hash crosses this surface, and nothing here opens a transaction or touches
+// a write path. Every method is an indexed aggregate — the envelope-bytes
+// scan is deliberately NOT reachable from enforcement.
+export interface QuotaReader {
+  // The storage-admission footprint: stored blob bytes plus the in-flight
+  // RESERVATION (sum of live sessions' declared sizes) and the live session
+  // count. Declared sizes are honest upper bounds: the part path has always
+  // rejected parts exceeding a session's declared total mid-upload, so actual
+  // assembled size never exceeds declared.
+  blobFootprint(accountId: string): { blobBytes: number; sessionCount: number; declaredBytes: number };
+
+  // Total sync rows for an account (index-only count; tombstones included,
+  // consistent with 3.1's charging).
+  syncRowCount(accountId: string): number;
+
+  // How many of these entityIds already exist for (app, account) — the
+  // net-new probe for the row cap, so updates to existing entities are never
+  // blocked by it. Read-only point lookups, outside any transaction; the
+  // benign TOCTOU this implies is documented at the call site.
+  countExistingEntities(app: string, accountId: string, entityIds: string[]): number;
+
+  // Current non-expired intent count (the same logical measure 3.1 reports).
+  intentCount(accountId: string): number;
+}
+
 // Thin storage interface — the ROOT store. Request handlers never see this
 // type: they receive an AccountStore from the scope resolver, and this root
 // interface deliberately cannot read or write account data at all except by
@@ -444,7 +471,7 @@ export interface UsageReporter {
 //
 // SQLite is the only implementation; a Postgres implementation can be added
 // later by satisfying this same contract without touching any handler code.
-export interface Store extends CredentialIssuer, CredentialAdmin, UsageReporter {
+export interface Store extends CredentialIssuer, CredentialAdmin, UsageReporter, QuotaReader {
   // Apply any pending migrations. Safe to call on every boot; a no-op once the
   // database is already at the current schema version.
   migrate(): void;

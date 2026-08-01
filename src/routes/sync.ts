@@ -2,6 +2,7 @@ import { Router, json, type Request, type Response } from "express";
 import type { SyncRowInput, SyncRowRecord } from "../storage/types.js";
 import type { Emit } from "../realtime/hub.js";
 import type { ScopeResolver } from "../scope.js";
+import type { QuotaGate } from "../quotas.js";
 
 // The three apps that share this server. The app path param is validated against
 // this set; anything else is rejected with 400.
@@ -50,7 +51,11 @@ function queryAccountId(req: Request): string | null {
 // dead ones); it is called AFTER the store write returns (durably committed) so
 // a nudged client that drains immediately sees the new rows. Push is an
 // optimization only: it never gates or fails the write.
-export function syncRouter(resolve: ScopeResolver, emit: Emit): Router {
+// gate (Phase 3.2): optional row-count cap at the batch path only. NET-NEW
+// entities only — updates to existing entities are never blocked. The
+// soft-delete and device-cursor routes below NEVER consult the gate
+// (recovery and tombstone-GC safety), and neither does anything else here.
+export function syncRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGate): Router {
   const router = Router();
 
   // Validate the app path param once for every route that carries it.
@@ -134,6 +139,19 @@ export function syncRouter(resolve: ScopeResolver, emit: Emit): Router {
     }
 
     const scoped = resolve(req, body.accountId);
+
+    // Row cap (Phase 3.2), before the write, outside any transaction. The
+    // net-new probe is read-only point lookups, so two devices racing can
+    // land a few rows over the cap (benign TOCTOU, documented): a soft cap
+    // that never over-blocks beats a serialized one that bottlenecks writes.
+    if (gate) {
+      const rejected = gate.admitSyncBatch(scoped.accountId, app, rows.map((r) => r.entityId));
+      if (rejected) {
+        res.status(rejected.status).json(rejected.body);
+        return;
+      }
+    }
+
     const result = scoped.batchUpsert(app, rows);
     // Real-time nudge (Phase 9), emitted ONLY for content writes. Two gates:
     //   - notify: a client marks a per-cycle BOOKKEEPING write (device-state /

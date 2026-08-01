@@ -5,6 +5,7 @@ import type { BlobStore } from "./storage/blobstore.js";
 import { DiskBlobStore } from "./storage/disk-blobstore.js";
 import { deviceTokenAuth } from "./middleware/auth.js";
 import { makeScopeResolver, ScopeError } from "./scope.js";
+import { makeQuotaGate } from "./quotas.js";
 import { credentialAuth } from "./middleware/credential-auth.js";
 import { enrollRouter, bootstrapSecretValidator } from "./routes/enroll.js";
 import { adminRouter, bootstrapAdminGuard } from "./routes/admin.js";
@@ -64,7 +65,9 @@ export function buildApp(
   const accountHub =
     hub ??
     new InProcessAccountHub(
-      DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT,
+      // Configurable since Phase 3.2; the default IS the constant the hub has
+      // always enforced, so an unset value changes nothing.
+      config.maxSseConnectionsPerAccount ?? DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT,
       config.maxSseConnections ?? DEFAULT_MAX_SSE_CONNECTIONS,
     );
 
@@ -157,14 +160,28 @@ export function buildApp(
   // except via forAccount.
   const resolveScope = makeScopeResolver(store, blobs, config.authMode ?? "shared");
 
+  // Quota gate (Phase 3.2). undefined when NO quota is configured — the
+  // routers then hold no gate and skip nothing-at-all, which is what makes
+  // "an unconfigured server changes nothing" structural rather than a flag
+  // check. Construction is CONFIG-driven, not mode-driven: no handler
+  // branches on mode, and quotas gate the OPERATIVE (resolver-bound) account
+  // in either mode. In shared mode that account is the claimed one, so
+  // quotas there are advisory (index.ts warns at startup).
+  const quotaGate = makeQuotaGate(store, {
+    storageBytes: config.quotaStorageBytes,
+    rows: config.quotaRows,
+    intents: config.quotaIntents,
+    uploads: config.quotaUploads,
+  });
+
   // Protected routes. Phase 1 adds the sync transport; the salt store is a
   // Phase 3 prerequisite; intents are the cross-app transport; Phase 7 adds the
   // content-addressed blob store; Phase 9 adds the SSE real-time push endpoint.
-  app.use("/sync", syncRouter(resolveScope, emit));
-  app.use("/intents", intentsRouter(resolveScope, emit));
+  app.use("/sync", syncRouter(resolveScope, emit, quotaGate));
+  app.use("/intents", intentsRouter(resolveScope, emit, quotaGate));
   app.use("/salt", saltRouter(resolveScope));
 
-  app.use("/blobs", blobsRouter(resolveScope, maxBlobSize));
+  app.use("/blobs", blobsRouter(resolveScope, maxBlobSize, quotaGate));
 
   // Real-time push (nudge-only SSE), authenticated and account-scoped exactly
   // like the routes above. See routes/events.ts for the event shape and the

@@ -53,6 +53,23 @@ function main(): void {
     }
   }
 
+  // Quotas configured in shared mode gate the CLAIMED account, which any
+  // client can rename: advisory, not enforcement. Warn, don't refuse — same
+  // treatment as the shared-token and equal-secrets warnings.
+  const anyQuota =
+    config.quotaStorageBytes !== undefined ||
+    config.quotaRows !== undefined ||
+    config.quotaIntents !== undefined ||
+    config.quotaUploads !== undefined;
+  if (anyQuota && config.authMode !== "per-account") {
+    console.warn(
+      "quotas: per-account quotas are configured but GLANCEVAULT_AUTH_MODE is " +
+        "shared. Quotas gate the accountId the client CLAIMS, and a client can " +
+        "evade them by renaming its claimed account — they are advisory without " +
+        "per-account identity. Enable per-account mode for real enforcement.",
+    );
+  }
+
   const store = new SqliteStore(config.storagePath);
   store.migrate();
 
