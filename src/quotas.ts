@@ -73,7 +73,11 @@ export interface QuotaGate {
 
   // Intent volume cap (current non-expired count). 429: flood-shaped, and it
   // self-heals as TTLs expire — the one genuinely self-recovering dimension.
-  admitIntents(accountId: string, batchSize: number): QuotaVerdict | null;
+  // NET-NEW events only, same dedup-before-quota rule as the other gates:
+  // insertIntents is insert-only, so a re-sent eventId writes nothing and
+  // must not be counted — a client retrying a batch whose response was lost
+  // is re-announcing delivered events, not adding volume.
+  admitIntents(accountId: string, eventIds: string[]): QuotaVerdict | null;
 }
 
 // Build the gate, or undefined when nothing is configured — the undefined is
@@ -126,8 +130,10 @@ export function makeQuotaGate(reader: QuotaReader, policy: QuotaPolicy): QuotaGa
         if (current + entityIds.length <= rows) {
           return null;
         }
-        const existing = reader.countExistingEntities(app, accountId, entityIds);
-        const netNew = new Set(entityIds).size - existing >= 0 ? new Set(entityIds).size - existing : 0;
+        // existing counts rows keyed by these ids, so it can never exceed the
+        // distinct id count: netNew is >= 0 by construction.
+        const distinct = new Set(entityIds).size;
+        const netNew = distinct - reader.countExistingEntities(app, accountId, entityIds);
         if (netNew > 0 && current + netNew > rows) {
           return verdict(413, "rows", rows, current, netNew);
         }
@@ -135,11 +141,17 @@ export function makeQuotaGate(reader: QuotaReader, policy: QuotaPolicy): QuotaGa
       return null;
     },
 
-    admitIntents(accountId, batchSize) {
-      if (intents !== undefined && batchSize > 0) {
+    admitIntents(accountId, eventIds) {
+      if (intents !== undefined && eventIds.length > 0) {
         const current = reader.intentCount(accountId);
-        if (current + batchSize > intents) {
-          return verdict(429, "intents", intents, current, batchSize);
+        // Fast path mirrors the row cap: even all-new, we'd fit.
+        if (current + eventIds.length <= intents) {
+          return null;
+        }
+        const distinct = new Set(eventIds).size;
+        const netNew = distinct - reader.countExistingIntentEvents(accountId, eventIds);
+        if (netNew > 0 && current + netNew > intents) {
+          return verdict(429, "intents", intents, current, netNew);
         }
       }
       return null;

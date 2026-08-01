@@ -619,6 +619,70 @@ test("per-account mode: enrollment is never gated, and quotas bind to the creden
   }
 });
 
+test("intent cap counts only NET-NEW event ids: an idempotent retry is never rejected", async () => {
+  const h = await start({ quotaIntents: 2 });
+  try {
+    const far = new Date(Date.now() + 3600_000).toISOString();
+    assert.equal((await sendIntents(h.base, "house-re", ["r1", "r2"], far)).status, 200);
+
+    // The retry trap the gate must not spring: the batch filled the cap, the
+    // response was lost, the client re-sends. The write is a no-op (insert-
+    // only dedup on eventId), so the gate must admit it.
+    const retry = await sendIntents(h.base, "house-re", ["r1", "r2"], far);
+    assert.equal(retry.status, 200);
+    assert.equal(((await retry.json()) as { written: number }).written, 0, "re-send wrote nothing");
+
+    // A mixed batch is gated on its new ids only: r1 is stored, r3 is new and
+    // over the cap — rejected, with `requested` counting just the new one.
+    const mixed = await sendIntents(h.base, "house-re", ["r1", "r3"], far);
+    assert.equal(mixed.status, 429);
+    assert.deepEqual(await mixed.json(), {
+      error: "quota exceeded",
+      quota: "intents",
+      limit: 2,
+      used: 2,
+      requested: 1,
+    });
+
+    // Duplicate ids WITHIN a batch count once (one row lands): at 1 of 2 used,
+    // ["d1","d1"] is one net-new event and fits.
+    assert.equal((await sendIntents(h.base, "house-dup", ["d0"], far)).status, 200);
+    assert.equal((await sendIntents(h.base, "house-dup", ["d1", "d1"], far)).status, 200);
+  } finally {
+    h.close();
+  }
+});
+
+test("oversized batches: the IN() probes chunk instead of hitting SQLite's variable limit", async () => {
+  const h = await start({ quotaRows: 10 });
+  try {
+    // Unit level: 40k ids is past the 32766-variable ceiling that used to
+    // throw "too many SQL variables". Seed a couple among them to prove the
+    // chunked count still counts correctly.
+    h.store.forAccount("house-big").batchUpsert("dayglance", [
+      { entityId: "n7", envelope: randomBytes(8), deleted: false },
+      { entityId: "n39999", envelope: randomBytes(8), deleted: false },
+    ]);
+    const ids = Array.from({ length: 40_000 }, (_, i) => `n${i}`);
+    assert.equal(h.store.countExistingEntities("dayglance", "house-big", ids), 2);
+    assert.equal(h.store.countExistingIntentEvents("house-big", ids), 0);
+
+    // End to end: a 40k-row batch against the row cap gets a clean 413 (the
+    // verdict it deserves), not a 500 from an oversized IN().
+    const res = await syncBatch(h.base, "house-big", ids, 8);
+    assert.equal(res.status, 413);
+    assert.deepEqual(await res.json(), {
+      error: "quota exceeded",
+      quota: "rows",
+      limit: 10,
+      used: 2,
+      requested: 39_998,
+    });
+  } finally {
+    h.close();
+  }
+});
+
 test("no quota configured: makeQuotaGate returns undefined (default-off is structural)", async () => {
   const h = await start(); // no quota keys at all
   try {

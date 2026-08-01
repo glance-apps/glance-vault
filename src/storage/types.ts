@@ -458,6 +458,16 @@ export interface QuotaReader {
 
   // Current non-expired intent count (the same logical measure 3.1 reports).
   intentCount(accountId: string): number;
+
+  // How many of these eventIds are already stored for the account — the
+  // net-new probe for the intent cap, mirroring countExistingEntities.
+  // insertIntents is insert-only (a re-sent eventId writes nothing), so a
+  // retried batch must not be counted against the cap: without this probe, a
+  // client whose batch filled the cap and whose response was lost would get
+  // 429 on the retry for events that are already durably delivered.
+  // Deliberately matches the write path's own dedup probe (existence
+  // regardless of expiry), so gate and write agree on what a re-send is.
+  countExistingIntentEvents(accountId: string, eventIds: string[]): number;
 }
 
 // Thin storage interface — the ROOT store. Request handlers never see this

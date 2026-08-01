@@ -29,9 +29,11 @@ services:
       GLANCEVAULT_ALLOWED_ORIGINS: ${GLANCEVAULT_ALLOWED_ORIGINS:-}
       GLANCEVAULT_PORT: "8080"
       GLANCEVAULT_STORAGE_PATH: /data/glancevault.db
-      # Optional: auth model, "shared" (default) or "per-account". Leave unset
-      # unless you are developing the per-account path — it is not implemented
-      # yet and changes no request handling. See the README.
+      # Optional: auth model, "shared" (default) or "per-account". Per-account
+      # gives every device its own credential (via POST /enroll) and binds it
+      # to one account — required for multi-tenant hosting and for quotas to
+      # be real enforcement. See the README before switching an existing
+      # deployment: every device must enroll before it can sync again.
       GLANCEVAULT_AUTH_MODE: ${GLANCEVAULT_AUTH_MODE:-}
       # Required only when GLANCEVAULT_AUTH_MODE=per-account: the bootstrap
       # secret devices exchange for per-device credentials at POST /enroll.
