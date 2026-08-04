@@ -337,11 +337,8 @@ browser or the Electron desktop app on a different origin, set
 is sent in the `Authorization` header, so it rides over the proxy unchanged.
 
 The `flush_interval -1` line is required for the real-time push endpoint to work
-through the proxy. On nginx the equivalent is `proxy_buffering off` for the
-`/events` location (the server also sends `X-Accel-Buffering: no`, which nginx
-honors). Any reverse proxy in front of the server must disable response
-buffering for `/events`, or SSE nudges get batched and clients silently fall
-back to polling.
+through the proxy. For nginx, Apache, Traefik and Cloudflare, see
+[Reverse proxies and the /events stream](#reverse-proxies-and-the-events-stream).
 
 Because per-IP rate limiting keys on the client address, the proxy must forward
 `X-Forwarded-For` and the server must trust it. `GLANCEVAULT_TRUST_PROXY` defaults
@@ -350,6 +347,162 @@ over localhost (the compose default). Caddy and nginx both set
 `X-Forwarded-For` automatically; if you front the server with additional hops,
 set `GLANCEVAULT_TRUST_PROXY` to the number of trusted proxies so a client cannot
 spoof its address and evade the limit.
+
+### Reverse proxies and the /events stream
+
+Every endpoint except `GET /events` is a normal request/response and works
+through any proxy with default settings. `/events` is different: it is a
+long-lived [Server-Sent Events](#real-time-push-sse) stream that the server
+writes to incrementally, and a proxy that buffers responses breaks it.
+
+#### What the server already sends
+
+You do not have to add any of this yourself. On `GET /events` the server
+(`src/routes/events.ts`) writes these response headers and flushes them before
+anything else:
+
+| Header | Value | Why |
+|---|---|---|
+| `Content-Type` | `text/event-stream` | The signal most proxies use to switch to streaming mode automatically. |
+| `Cache-Control` | `no-cache, no-transform` | Asks caches and transforming proxies to leave the stream alone. |
+| `Connection` | `keep-alive` | The stream stays open until the client disconnects. |
+| `X-Accel-Buffering` | `no` | nginx-specific opt out of response buffering. nginx honors it; most other proxies ignore it. |
+
+Immediately after the headers, the server writes an `event: ready` frame, then a
+`: heartbeat` comment line every 20 seconds for the life of the connection. The
+heartbeat interval is fixed at 20s in the server (`DEFAULT_HEARTBEAT_MS`) and is
+not configurable through the environment, so you can size proxy timeouts against
+that number. The server also runs no compression middleware of its own: nothing
+in the app layer gzips the stream, so any compression you see is coming from
+your proxy.
+
+#### The symptom
+
+A buffering proxy does not produce an error. The connection opens, the proxy
+accepts the response, and then it holds the bytes waiting for a buffer to fill
+or the response to end. Neither ever happens on a stream that stays open, so the
+client sees a connection that is up but silent.
+
+The GLANCE clients treat a silent stream as a dead stream and fall back to the
+polling backstop, which is exactly what push is layered on top of. Sync keeps
+working and nothing is lost; you just lose instant delivery and get changes at
+the polling interval instead. That is why this failure is easy to miss: the only
+visible difference is that other devices take a while to catch up.
+
+#### nginx
+
+nginx buffers proxied responses by default. Give `/events` its own location:
+
+```nginx
+server {
+    server_name vault.example.com;
+
+    # Everything else: ordinary buffered proxying is correct.
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # The SSE push endpoint.
+    location /events {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_buffering    off;         # do not accumulate the response
+        proxy_cache        off;         # never serve or store a stream
+        gzip               off;         # gzip needs a buffer to compress into
+        proxy_http_version 1.1;         # HTTP/1.0 upstream closes per response
+        proxy_set_header   Connection "";   # keep the upstream connection open
+        proxy_read_timeout 90s;         # well above the 20s heartbeat
+    }
+}
+```
+
+`proxy_read_timeout` is the gap nginx tolerates between reads from the upstream.
+The default is 60s, which is above the 20s heartbeat and so usually survives, but
+90s leaves room for a delayed tick without the proxy tearing down a healthy
+stream. The server's `X-Accel-Buffering: no` header already turns buffering off
+on its own; `proxy_buffering off` makes it explicit and independent of that
+header, and the cache, gzip, HTTP version and timeout lines are not covered by it
+at all.
+
+#### Caddy 2 and Traefik
+
+No action needed. Both detect `text/event-stream` and stream it through without
+buffering. The `flush_interval -1` in the [Caddyfile above](#behind-caddy) is
+belt and braces: it forces immediate flushing for every response through that
+`reverse_proxy`, so the stream cannot be buffered even if content-type detection
+were bypassed. Traefik needs no equivalent directive.
+
+#### Apache 2.4 (mod_proxy_http)
+
+`mod_proxy_http` streams `text/event-stream` responses by default, so the proxy
+itself is fine. The one thing to change is compression: if `mod_deflate` is
+enabled, exempt the stream from it.
+
+```apache
+<VirtualHost *:443>
+    ServerName vault.example.com
+
+    ProxyPreserveHost On
+    ProxyPass        / http://127.0.0.1:8080/
+    ProxyPassReverse / http://127.0.0.1:8080/
+
+    # mod_deflate buffers the response while compressing it, which stalls SSE.
+    SetEnvIf Request_URI ^/events no-gzip
+</VirtualHost>
+```
+
+#### Cloudflare
+
+SSE passes through Cloudflare's proxy without configuration. Cloudflare closes
+idle proxied connections, and the server's ~20s heartbeat keeps the stream well
+inside that window, so a live `/events` connection is never idle from
+Cloudflare's point of view.
+
+#### Verify it
+
+Run this from outside your network, against the public hostname, so the request
+actually traverses the proxy. A `curl` from the vault host itself usually hits
+the app directly and proves nothing about your proxy.
+
+```
+curl -sN -H "Authorization: Bearer <device-token>" \
+  "https://vault.example.com/events?accountId=<id>"
+```
+
+The `-N` is required: it disables curl's own output buffering, which would
+otherwise reproduce the exact symptom you are testing for. The bearer token is
+`GLANCEVAULT_DEVICE_TOKEN` in shared auth mode, or the account's `gvc_...`
+credential in per-account mode (see
+[Auth model](#auth-model-glancevault_auth_mode)).
+
+Healthy, buffering disabled. The `ready` frame arrives within a second or two,
+then a comment line roughly every 20 seconds:
+
+```
+event: ready
+data: {"seq":42}
+
+: heartbeat
+
+: heartbeat
+```
+
+Still buffering. The connection opens and stays open, but nothing prints, not
+even after a minute:
+
+```
+(no output)
+```
+
+If you get output on `curl` but the apps still behave as if push is off, the
+proxy is fine and the problem is elsewhere: check CORS and mixed content under
+[Connecting a browser app](#connecting-a-browser-app).
 
 ### Connecting a browser app
 
@@ -533,10 +686,11 @@ block or fail the underlying write. The pub/sub is in-process and
 single-container by design; horizontally-scaled push is deferred with the paid
 product (spec §13, §14.3).
 
-> **Reverse proxy:** the `/events` response must not be buffered. Configure
-> Caddy with `flush_interval -1` (or nginx with `proxy_buffering off`) as shown
-> in [Behind Caddy](#behind-caddy), or nudges are batched and clients fall back
-> to polling.
+> **Reverse proxy:** the `/events` response must not be buffered, or nudges are
+> batched and clients fall back to polling. Caddy and Traefik need nothing;
+> nginx and Apache need one directive each. See
+> [Reverse proxies and the /events stream](#reverse-proxies-and-the-events-stream)
+> for the configuration and a verification command.
 
 ```
 # Subscribe to account "house-1" (streams until interrupted).
