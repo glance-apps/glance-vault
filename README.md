@@ -597,6 +597,15 @@ has drained cannot spin the account's seq. A `deletedAt` sent on such a
 re-delete is ignored: the first tombstone's timestamp is the one every client
 already has. Deleting a row the server has never seen is still a 404.
 
+The batch path is idempotent for re-deletes on the same terms: a row sent with
+`deleted: true` whose entity is already a tombstone with the **same envelope
+bytes** is skipped — no seq, not counted in `written`, no nudge — and a changed
+`deletedAt` alone does not defeat the skip. A tombstone whose envelope actually
+changed is still a real write and still advances the seq, so no content is
+dropped. Note this is the *only* content-aware skip in the batch path: an
+identical re-send of a **live** row still advances the seq by design, so a
+partial-write retry stays safe and self-healing.
+
 ### Hit the batch endpoint with curl
 
 ```
@@ -686,8 +695,8 @@ Events on the wire:
 Only content writes nudge. Bookkeeping writes never do: the device-cursor
 endpoint (`POST /sync/:app/device`) does not advance `seq` and never nudges, and
 a batch write sent with `notify: false` (used for device-state / high-water-mark
-rows) commits without nudging. A soft-delete of a row that is already deleted
-publishes nothing, so it does not nudge either. This prevents a per-cycle
+rows) commits without nudging. A re-delete of a row that is already deleted
+publishes nothing, through either delete path, so it does not nudge either. This prevents a per-cycle
 housekeeping write from provoking a nudge → drain → housekeep → nudge self-loop,
 while genuine content changes still nudge instantly.
 

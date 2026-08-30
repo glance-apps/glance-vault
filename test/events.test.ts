@@ -554,6 +554,38 @@ test("a re-delete of an already-deleted row fires no nudge and does not advance 
   }
 });
 
+test("an unchanged batch re-delete fires no nudge", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-batch-redelete-silent";
+    await postBatch(h.base, "dayglance", account, [{ entityId: "gone", envelope: garbageEnvelope() }]);
+
+    const c = await SseClient.connect(h.base, account);
+    await c.nextEvent("ready");
+
+    // Tombstoning the live row is a content write: it nudges.
+    const tomb = garbageEnvelope();
+    const first = await postBatch(h.base, "dayglance", account, [
+      { entityId: "gone", envelope: tomb, deleted: true },
+    ]);
+    assert.equal(first.body.maxSeq, 2);
+    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 2 });
+
+    // Re-sending the identical tombstone writes nothing, so maxSeq is 0 and the
+    // route's existing `maxSeq > 0` gate already suppresses the nudge. This is
+    // the batch-path half of the seq-churn loop.
+    const again = await postBatch(h.base, "dayglance", account, [
+      { entityId: "gone", envelope: tomb, deleted: true },
+    ]);
+    assert.deepEqual(again.body, { written: 0, maxSeq: 0 });
+    assert.equal(h.store.forAccount(account).latestSeq(), 2, "the re-delete did not advance the seq");
+    await assert.rejects(c.nextEvent("activity", 300), /timed out/, "an unchanged re-delete fires no nudge");
+    c.close();
+  } finally {
+    h.close();
+  }
+});
+
 test("a subscribed connection is nudged when an intent lands", async () => {
   const h = await startServer();
   try {

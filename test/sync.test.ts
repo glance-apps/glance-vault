@@ -404,6 +404,73 @@ test("deleting an already-deleted row returns the same seq and advances the acco
   }
 });
 
+// 5a-ter. The same idempotency through the batch path: a `deleted: true` row
+// written over a row that is already a tombstone republishes nothing, so it
+// must not consume a seq or nudge either -- otherwise the churn loop is simply
+// reachable through a different route. Scoped to unchanged bytes: a tombstone
+// whose envelope genuinely changes is still a real write.
+test("a batch re-delete with unchanged bytes consumes no seq; a changed one still writes", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-batch-redelete";
+    const live = garbageEnvelope();
+    await postBatch(h.base, "dayglance", account, [{ entityId: "gone", envelope: live }]);
+
+    // First tombstone through the batch path: a real write.
+    const tomb = garbageEnvelope();
+    const first = await postBatch(h.base, "dayglance", account, [
+      { entityId: "gone", envelope: tomb, deleted: true },
+    ]);
+    assert.equal(first.body.written, 1, "the first tombstone is a real write");
+    const tombSeq = first.body.maxSeq;
+    assert.equal(h.store.forAccount(account).latestSeq(), tombSeq);
+    const afterFirst = (await getRow(h.base, "dayglance", account, "gone")).body as WireRow;
+
+    // Re-sending the identical tombstone is a no-op: nothing written, no seq.
+    const again = await postBatch(h.base, "dayglance", account, [
+      { entityId: "gone", envelope: tomb, deleted: true },
+    ]);
+    assert.equal(again.status, 200, "the re-delete still succeeds");
+    assert.equal(again.body.written, 0, "an unchanged re-delete writes nothing");
+    assert.equal(again.body.maxSeq, 0, "an unchanged re-delete assigns no seq");
+    assert.equal(
+      h.store.forAccount(account).latestSeq(),
+      tombSeq,
+      "the account seq did not move on the re-delete",
+    );
+    assert.deepEqual(
+      (await getRow(h.base, "dayglance", account, "gone")).body as WireRow,
+      afterFirst,
+      "the re-delete left the tombstone untouched",
+    );
+
+    // A fresh deletedAt alone does not defeat the skip -- otherwise a client
+    // that stamps Date.now() every cleanup pass keeps churning.
+    const restamped = await postBatch(h.base, "dayglance", account, [
+      { entityId: "gone", envelope: tomb, deleted: true, deletedAt: 1_752_000_000_000 },
+    ]);
+    assert.equal(restamped.body.written, 0, "a re-delete with a new deletedAt is still a no-op");
+    assert.equal(h.store.forAccount(account).latestSeq(), tombSeq);
+
+    // But a tombstone whose ENVELOPE changed is real content: it is written and
+    // does advance the seq, so nothing is silently dropped.
+    const changed = await postBatch(h.base, "dayglance", account, [
+      { entityId: "gone", envelope: garbageEnvelope(), deleted: true },
+    ]);
+    assert.equal(changed.body.written, 1, "a changed tombstone envelope is still written");
+    assert.ok(changed.body.maxSeq > tombSeq, "a changed tombstone advances the seq");
+
+    // And deleting a LIVE row through the batch path is untouched by all of this.
+    await postBatch(h.base, "dayglance", account, [{ entityId: "other", envelope: garbageEnvelope() }]);
+    const killOther = await postBatch(h.base, "dayglance", account, [
+      { entityId: "other", envelope: garbageEnvelope(), deleted: true },
+    ]);
+    assert.equal(killOther.body.written, 1, "tombstoning a live row is a normal write");
+  } finally {
+    h.close();
+  }
+});
+
 // 5a-bis. deletedAt (tombstone LWW): a soft-delete carries an optional deletedAt
 // (epoch ms) query param the client v1.6.0 sends. The server persists it and
 // returns it on list and single-row GET. A legacy delete (no param) stores null,

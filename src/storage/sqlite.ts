@@ -205,8 +205,10 @@ export class SqliteStore implements Store {
   // transaction as the write so seq and row commit together. On conflict the row
   // is replaced with the new envelope, seq, deleted, and server_mtime, using the
   // newly assigned seq (excluded.seq) rather than the original, so a re-upserted
-  // row advances past its previous cursor position. A single batch of K rows
-  // advances the account seq by exactly K, never more.
+  // row advances past its previous cursor position. A batch of K rows advances
+  // the account seq by at most K, never more: the two no-op cases below (an
+  // insert-only row that already exists, and an unchanged re-delete) consume no
+  // seq and are not counted in written.
   private batchUpsert(app: string, accountId: string, rows: SyncRowInput[]): BatchResult {
     // An identical re-send (same envelope bytes) intentionally advances seq
     // rather than no-opping. This is the designed behavior: it keeps every write
@@ -234,6 +236,14 @@ export class SqliteStore implements Store {
     const exists = this.db.prepare(
       `SELECT 1 FROM sync_rows WHERE account_id = ? AND app = ? AND entity_id = ?`,
     );
+    // The tombstone probe for the re-delete no-op below. Deliberately filtered
+    // to deleted = 1 so it returns nothing for a live row: only a row that is
+    // ALREADY a tombstone pays the envelope read, and the ordinary live-write
+    // path is untouched.
+    const tombstone = this.db.prepare(
+      `SELECT envelope FROM sync_rows
+       WHERE account_id = ? AND app = ? AND entity_id = ? AND deleted = 1`,
+    );
 
     return this.transaction(() => {
       let written = 0;
@@ -243,6 +253,31 @@ export class SqliteStore implements Store {
           // First-write-wins: the entity already exists, so leave it untouched
           // and do not advance the seq. Not counted in written.
           continue;
+        }
+        if (row.deleted) {
+          // Idempotent re-delete through the batch path, the same no-op
+          // softDeleteRow performs for DELETE /sync/:app/:entityId. Writing a
+          // tombstone over a tombstone republishes nothing, but the unconditional
+          // seq bump below would mint a seq and nudge every connected client --
+          // and a client whose cleanup re-sends the tombstones it just drained
+          // keeps that cycle running by itself (the seq-churn loop observed live
+          // on 2026-08-30).
+          // Scoped tightly, because unlike DELETE a batch row carries content:
+          // the skip applies ONLY when the envelope bytes are unchanged, so a
+          // client that genuinely rewrites a tombstone's envelope still gets a
+          // seq and still reaches every device. This is not the content-aware
+          // idempotency rejected for live rows above: it costs one indexed read
+          // on the tombstone path alone, never on a live upsert.
+          // A changed deletedAt does NOT defeat the skip, matching DELETE: the
+          // first tombstone's timestamp is the one every client already has, and
+          // honoring a fresh one would reopen the loop for any client that stamps
+          // Date.now() on each cleanup pass.
+          const prior = tombstone.get(accountId, app, row.entityId) as
+            | { envelope: Buffer }
+            | undefined;
+          if (prior && prior.envelope.equals(row.envelope)) {
+            continue;
+          }
         }
         const seq = this.nextSeq(accountId);
         upsert.run({

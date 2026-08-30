@@ -212,6 +212,14 @@ export interface AccountStore {
   // insertOnly is the exception: if its entity already exists it is skipped
   // entirely (not overwritten and not assigned a seq), so written counts only
   // the rows actually inserted or overwritten.
+  //
+  // The one other skip is an unchanged re-delete: a row with deleted: true whose
+  // entity is ALREADY a tombstone with byte-identical envelope republishes
+  // nothing, so it consumes no seq and is not counted in written -- the same
+  // idempotency softDeleteRow gives the DELETE route, so neither delete path can
+  // be driven into seq churn. A re-delete whose envelope differs is a real
+  // content change and is written normally; a differing deletedAt alone is not,
+  // and does not defeat the skip.
   batchUpsert(app: string, rows: SyncRowInput[]): BatchResult;
 
   // Incremental fetch: rows for this app with seq strictly greater than since,
