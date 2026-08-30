@@ -30,7 +30,9 @@ it. It does not design the paid hosted product.
 - An encrypted media blob store for lifeGLANCE milestone media (images,
   audio, video). Backend-only; the file tier does not get media.
 - Multi-user for trusted households (users are ordinary synced rows).
-- Support for all three apps: dayGLANCE, lastGLANCE, lifeGLANCE.
+- Support for all three apps: dayGLANCE, lastGLANCE, lifeGLANCE. Companion
+  integrations may claim their own app namespace alongside them; dayGLANCE's
+  Obsidian bridge plugin syncs as `dayglance-bridge`.
 - A selectable client transport so the database backend sits alongside the
   existing file tier rather than replacing it in the codebase.
 
@@ -129,7 +131,8 @@ it. It does not design the paid hosted product.
 ### 3.1 Deployment topology
 
 A single `docker-compose.yml` runs the GLANCEvault server plus its database
-(SQLite by default). All three apps point at that one server. The apps are
+(SQLite by default). All three apps point at that one server, as do companion
+integrations with their own app namespace (`dayglance-bridge`). The apps are
 clients (browser PWA, Electron, mobile); only the server touches the
 database. The apps do not share the database directly. The `app` column
 namespaces each app's rows in the shared tables. For self-hosters this is the
@@ -282,7 +285,7 @@ has open implementation details and should not bloat the Phase 0 migrations.
 -- Durable per-entity state. One row per entity, or per event for insert-only types.
 CREATE TABLE sync_rows (
   account_id   TEXT        NOT NULL,   -- household/instance scope; constant for single-tenant self-host
-  app          TEXT        NOT NULL,   -- 'dayglance' | 'lastglance' | 'lifeglance'; plaintext, for per-app fetch
+  app          TEXT        NOT NULL,   -- 'dayglance' | 'dayglance-bridge' | 'lastglance' | 'lifeglance'; plaintext, for per-app fetch
   entity_id    TEXT        NOT NULL,   -- stable client UUID; idempotency + version key
   seq          BIGINT      NOT NULL,   -- server-assigned, monotonic per account; THE cursor
   envelope     BYTEA       NOT NULL,   -- full Phase 2.7 envelope; server stores opaquely

@@ -468,6 +468,21 @@ test("apps are isolated within an account", async () => {
     const lastRows = await listRows(h.base, "lastglance", account, 0);
     assert.equal(lastRows.body.rows.length, 1, "lastglance has only its own row");
 
+    // The Obsidian bridge plugin syncs under its own app namespace, which is
+    // allowed and isolated from dayGLANCE proper just like any other app.
+    const bridgeEmpty = await listRows(h.base, "dayglance-bridge", account, 0);
+    assert.equal(bridgeEmpty.status, 200, "dayglance-bridge is an accepted app");
+    assert.equal(bridgeEmpty.body.rows.length, 0, "dayglance rows do not leak into the bridge");
+
+    const bridgeWritten = await postBatch(h.base, "dayglance-bridge", account, [
+      { entityId: "b1", envelope: garbageEnvelope() },
+    ]);
+    assert.equal(bridgeWritten.status, 200, "dayglance-bridge accepts a batch");
+    const bridgeRows = await listRows(h.base, "dayglance-bridge", account, 0);
+    assert.equal(bridgeRows.body.rows.length, 1, "dayglance-bridge has only its own row");
+    const dayAfterBridge = await listRows(h.base, "dayglance", account, 0);
+    assert.equal(dayAfterBridge.body.rows.length, 2, "bridge rows do not leak into dayglance");
+
     // And an unknown app is rejected.
     const bad = await fetch(`${h.base}/sync/bogus/list?accountId=${account}`, {
       headers: authHeaders(),

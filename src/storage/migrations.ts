@@ -30,7 +30,7 @@ const MIGRATIONS: Migration[] = [
       -- grain last writer wins); the server only orders, it never merges.
       CREATE TABLE sync_rows (
         account_id   TEXT    NOT NULL,           -- household/instance scope
-        app          TEXT    NOT NULL,           -- 'dayglance' | 'lastglance' | 'lifeglance'
+        app          TEXT    NOT NULL,           -- 'dayglance' | 'dayglance-bridge' | 'lastglance' | 'lifeglance'
         entity_id    TEXT    NOT NULL,           -- stable client UUID
         seq          INTEGER NOT NULL,           -- server-assigned monotonic per account
         envelope     BLOB    NOT NULL,           -- opaque encrypted bytes
