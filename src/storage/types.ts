@@ -40,6 +40,17 @@ export interface ListResult {
   hasMore: boolean;
 }
 
+// The result of a soft-delete. seq is the tombstone's seq: freshly assigned
+// when this call is what deleted the row, or the seq the existing tombstone
+// already carries when the row was deleted before. alreadyDeleted distinguishes
+// the two, and is the flag the HTTP layer uses to decide whether there is
+// anything to nudge connected clients about -- a re-delete publishes nothing,
+// so it must not emit.
+export interface SoftDeleteResult {
+  seq: number;
+  alreadyDeleted: boolean;
+}
+
 // An intent event as accepted from a client for insert. The server treats
 // envelope as opaque bytes (it never parses it, exactly like a sync envelope).
 // expiresAt is the client-supplied TTL: a canonical ISO-8601 UTC timestamp,
@@ -201,6 +212,14 @@ export interface AccountStore {
   // insertOnly is the exception: if its entity already exists it is skipped
   // entirely (not overwritten and not assigned a seq), so written counts only
   // the rows actually inserted or overwritten.
+  //
+  // The one other skip is an unchanged re-delete: a row with deleted: true whose
+  // entity is ALREADY a tombstone with byte-identical envelope republishes
+  // nothing, so it consumes no seq and is not counted in written -- the same
+  // idempotency softDeleteRow gives the DELETE route, so neither delete path can
+  // be driven into seq churn. A re-delete whose envelope differs is a real
+  // content change and is written normally; a differing deletedAt alone is not,
+  // and does not defeat the skip.
   batchUpsert(app: string, rows: SyncRowInput[]): BatchResult;
 
   // Incremental fetch: rows for this app with seq strictly greater than since,
@@ -215,7 +234,13 @@ export interface AccountStore {
   // record the client-supplied deletedAt (epoch ms; null when the client omits
   // it), all in one transaction. Returns the new seq, or null if the row does
   // not exist.
-  softDeleteRow(app: string, entityId: string, deletedAt?: number | null): { seq: number } | null;
+  //
+  // Idempotent on an already-deleted row: the tombstone is left exactly as it
+  // is (same seq, same server_mtime, same deleted_at -- a newer deletedAt on
+  // the re-delete is ignored) and the result reports alreadyDeleted: true so
+  // callers can skip the real-time nudge. Deleting a tombstone must never mint
+  // a fresh seq; see SoftDeleteResult.
+  softDeleteRow(app: string, entityId: string, deletedAt?: number | null): SoftDeleteResult | null;
 
   // Insert a batch of intent events. INSERT-ONLY: a re-sent event_id is a
   // harmless no-op, never an update, and consumes no seq. Each newly inserted

@@ -272,6 +272,9 @@ export function syncRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGate)
   // optional deletedAt (epoch ms) the client v1.6.0 sends so the tombstone can
   // drive last-writer-wins. Absent/invalid deletedAt is stored as null, which
   // clients read as delete-wins (legacy semantics).
+  // Deleting an already-deleted row is idempotent: the store returns the
+  // existing tombstone's seq without assigning a new one, so the response is
+  // unchanged for the client and nothing is emitted (see the emit guard below).
   router.delete("/:app/:entityId", (req: Request, res: Response) => {
     const accountId = queryAccountId(req);
     if (accountId === null) {
@@ -293,11 +296,18 @@ export function syncRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGate)
       res.status(404).json({ error: "not found" });
       return;
     }
-    // A soft-delete advances the account seq (a new tombstone seq), so nudge
-    // connected clients to drain. Post-commit, best-effort. Keyed by the
-    // scope's derived account (Phase 1.3b), not the claimed string.
-    emit(scoped.accountId, { seq: result.seq });
-    res.status(200).json(result);
+    // A soft-delete that actually tombstoned the row advances the account seq
+    // (a new tombstone seq), so nudge connected clients to drain. Post-commit,
+    // best-effort. Keyed by the scope's derived account (Phase 1.3b), not the
+    // claimed string.
+    // A re-delete of an already-deleted row assigned no seq and changed
+    // nothing, so there is nothing to drain: emitting there would nudge every
+    // connected client into a fetch that returns no new rows, and a client that
+    // re-deletes what it drains would keep the loop alive by itself.
+    if (!result.alreadyDeleted) {
+      emit(scoped.accountId, { seq: result.seq });
+    }
+    res.status(200).json({ seq: result.seq });
   });
 
   return router;
