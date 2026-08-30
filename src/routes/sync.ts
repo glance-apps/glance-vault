@@ -4,9 +4,11 @@ import type { Emit } from "../realtime/hub.js";
 import type { ScopeResolver } from "../scope.js";
 import type { QuotaGate } from "../quotas.js";
 
-// The three apps that share this server. The app path param is validated against
-// this set; anything else is rejected with 400.
-const ALLOWED_APPS = new Set(["dayglance", "lastglance", "lifeglance"]);
+// The app namespaces that share this server: the three GLANCE apps plus
+// `dayglance-bridge`, dayGLANCE's Obsidian bridge plugin, which syncs its
+// pairing meta, intent and observation rows under its own namespace. The app
+// path param is validated against this set; anything else is rejected with 400.
+const ALLOWED_APPS = new Set(["dayglance", "dayglance-bridge", "lastglance", "lifeglance"]);
 
 const DEFAULT_LIMIT = 500;
 const MAX_LIMIT = 1000;

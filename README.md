@@ -253,7 +253,8 @@ so a typo cannot leave you believing an auth model is on when it is not.
 ## Run with docker compose
 
 All three GLANCE apps (dayGLANCE, lastGLANCE, lifeGLANCE) point at this one
-server. The compose example reflects that: one endpoint, one token, with the
+server, as does dayGLANCE's Obsidian bridge plugin under its own
+`dayglance-bridge` app namespace. The compose example reflects that: one endpoint, one token, with the
 `app` column on the server namespacing each app's rows.
 
 ```
@@ -549,8 +550,10 @@ no token in either mode.
 ## Sync transport endpoints
 
 All sync endpoints sit under `/sync` and require the device token. The `:app`
-path segment must be one of `dayglance`, `lastglance`, or `lifeglance`; anything
-else is rejected with 400. The `envelope` field is opaque bytes: base64-encoded
+path segment must be one of `dayglance`, `dayglance-bridge`, `lastglance`, or
+`lifeglance`; anything else is rejected with 400. (`dayglance-bridge` is the
+namespace for dayGLANCE's Obsidian bridge plugin, which syncs its own rows
+alongside dayGLANCE proper.) The `envelope` field is opaque bytes: base64-encoded
 on the wire and stored as a BLOB the server never parses.
 
 | Method | Path | Purpose |
