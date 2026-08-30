@@ -338,6 +338,72 @@ test("soft-delete marks the row deleted and advances its seq", async () => {
   }
 });
 
+// 5a. Re-deleting an already-deleted row is idempotent: no fresh seq, no
+// touched tombstone. Re-tombstoning let a client that re-deletes the tombstones
+// it drains keep minting seqs forever -- a self-sustaining churn loop (observed
+// live 2026-08-30, the dayGLANCE bridge plugin's intent cleanup looping for
+// hours and saturating the per-IP rate budget).
+test("deleting an already-deleted row returns the same seq and advances the account seq once", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-redelete";
+    const write = await postBatch(h.base, "dayglance", account, [
+      { entityId: "gone", envelope: garbageEnvelope() },
+    ]);
+    const seqBefore = write.body.maxSeq;
+    assert.equal(h.store.forAccount(account).latestSeq(), seqBefore);
+
+    const first = await fetch(
+      `${h.base}/sync/dayglance/gone?accountId=${account}`,
+      { method: "DELETE", headers: authHeaders() },
+    );
+    assert.equal(first.status, 200);
+    const firstBody = (await first.json()) as { seq: number };
+    assert.ok(firstBody.seq > seqBefore, "the first delete assigned a fresh tombstone seq");
+
+    // The tombstone exactly as the first delete left it.
+    const afterFirst = (await getRow(h.base, "dayglance", account, "gone")).body as WireRow;
+
+    const second = await fetch(
+      `${h.base}/sync/dayglance/gone?accountId=${account}`,
+      { method: "DELETE", headers: authHeaders() },
+    );
+    assert.equal(second.status, 200, "a re-delete still succeeds");
+    const secondBody = (await second.json()) as { seq: number };
+    assert.equal(secondBody.seq, firstBody.seq, "the re-delete returns the existing tombstone seq");
+
+    // The account seq moved exactly once across BOTH deletes.
+    assert.equal(
+      h.store.forAccount(account).latestSeq(),
+      firstBody.seq,
+      "the account seq advanced exactly once for two deletes",
+    );
+
+    // And the stored tombstone is byte-identical: same seq, same server_mtime,
+    // same deletedAt.
+    const afterSecond = (await getRow(h.base, "dayglance", account, "gone")).body as WireRow;
+    assert.deepEqual(afterSecond, afterFirst, "the re-delete left the tombstone untouched");
+
+    // Nothing new is published past the first tombstone's cursor either.
+    const past = await listRows(h.base, "dayglance", account, firstBody.seq);
+    assert.equal(past.body.rows.length, 0, "the re-delete published no row past the tombstone");
+
+    // A re-delete carrying a NEWER deletedAt is ignored too: still no new seq,
+    // and the tombstone timestamp the first delete stored is left as-is.
+    const withTs = await fetch(
+      `${h.base}/sync/dayglance/gone?accountId=${account}&deletedAt=${1_752_000_000_000}`,
+      { method: "DELETE", headers: authHeaders() },
+    );
+    assert.equal(withTs.status, 200);
+    assert.equal(((await withTs.json()) as { seq: number }).seq, firstBody.seq);
+    assert.equal(h.store.forAccount(account).latestSeq(), firstBody.seq);
+    const afterTs = (await getRow(h.base, "dayglance", account, "gone")).body as WireRow;
+    assert.deepEqual(afterTs, afterFirst, "a newer deletedAt on a re-delete is ignored");
+  } finally {
+    h.close();
+  }
+});
+
 // 5a-bis. deletedAt (tombstone LWW): a soft-delete carries an optional deletedAt
 // (epoch ms) query param the client v1.6.0 sends. The server persists it and
 // returns it on list and single-row GET. A legacy delete (no param) stores null,

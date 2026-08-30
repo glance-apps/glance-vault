@@ -10,6 +10,7 @@ import type {
   SyncRowRecord,
   BatchResult,
   ListResult,
+  SoftDeleteResult,
   IntentEventInput,
   IntentEventRecord,
   IntentBatchResult,
@@ -306,17 +307,31 @@ export class SqliteStore implements Store {
     accountId: string,
     entityId: string,
     deletedAt: number | null = null,
-  ): { seq: number } | null {
+  ): SoftDeleteResult | null {
     const deletedAtValue =
       typeof deletedAt === "number" && Number.isFinite(deletedAt) ? deletedAt : null;
     return this.transaction(() => {
       const existing = this.db
         .prepare(
-          `SELECT 1 FROM sync_rows WHERE account_id = ? AND app = ? AND entity_id = ?`,
+          `SELECT seq, deleted FROM sync_rows WHERE account_id = ? AND app = ? AND entity_id = ?`,
         )
-        .get(accountId, app, entityId);
+        .get(accountId, app, entityId) as { seq: number; deleted: number } | undefined;
       if (!existing) {
         return null;
+      }
+      // Idempotent re-delete: the row is already a tombstone, so there is
+      // nothing new to publish. Return the seq it already carries and leave the
+      // row completely untouched -- no nextSeq, no server_mtime, no deleted_at.
+      // Re-tombstoning would mint a fresh seq and nudge every connected client,
+      // and a client whose cleanup pass re-deletes the tombstones it just saw
+      // then deletes them again on the next drain: a self-sustaining seq-churn
+      // loop (observed live 2026-08-30, the dayGLANCE bridge plugin looping for
+      // hours against the per-IP rate budget). A newer deletedAt on the
+      // re-delete is deliberately ignored: the first tombstone's timestamp is
+      // the one that already reached every client, and rewriting it in place
+      // would silently change LWW outcomes without a seq for anyone to notice.
+      if (existing.deleted === 1) {
+        return { seq: existing.seq, alreadyDeleted: true };
       }
       const seq = this.nextSeq(accountId);
       this.db
@@ -326,7 +341,7 @@ export class SqliteStore implements Store {
            WHERE account_id = ? AND app = ? AND entity_id = ?`,
         )
         .run(seq, new Date().toISOString(), deletedAtValue, accountId, app, entityId);
-      return { seq };
+      return { seq, alreadyDeleted: false };
     });
   }
 

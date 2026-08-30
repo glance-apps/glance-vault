@@ -524,6 +524,36 @@ test("a subscribed connection is nudged when a sync soft-delete advances the seq
   }
 });
 
+test("a re-delete of an already-deleted row fires no nudge and does not advance the seq", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-redelete-silent";
+    await postBatch(h.base, "dayglance", account, [{ entityId: "gone", envelope: garbageEnvelope() }]);
+
+    const c = await SseClient.connect(h.base, account);
+    await c.nextEvent("ready");
+
+    // The real delete nudges once, as always.
+    const del = await deleteRow(h.base, "dayglance", account, "gone");
+    assert.equal(del.status, 200);
+    assert.deepEqual(del.body, { seq: 2 });
+    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 2 });
+
+    // Re-deleting the tombstone publishes nothing, so it must not nudge. A
+    // nudge here is the seq-churn loop: every connected client is woken to
+    // drain nothing, and a client that re-deletes what it drains keeps the
+    // cycle running on its own.
+    const again = await deleteRow(h.base, "dayglance", account, "gone");
+    assert.equal(again.status, 200);
+    assert.deepEqual(again.body, { seq: 2 }, "the re-delete reports the existing tombstone seq");
+    assert.equal(h.store.forAccount(account).latestSeq(), 2, "the re-delete did not advance the seq");
+    await assert.rejects(c.nextEvent("activity", 300), /timed out/, "a re-delete fires no nudge");
+    c.close();
+  } finally {
+    h.close();
+  }
+});
+
 test("a subscribed connection is nudged when an intent lands", async () => {
   const h = await startServer();
   try {

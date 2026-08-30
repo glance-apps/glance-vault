@@ -562,7 +562,7 @@ on the wire and stored as a BLOB the server never parses.
 | POST | `/sync/:app/device` | Report a device's sync cursor (forward only) |
 | GET | `/sync/:app/list` | Incremental fetch of rows with `seq > since` |
 | GET | `/sync/:app/:entityId` | Fetch a single row, or 404 |
-| DELETE | `/sync/:app/:entityId` | Soft-delete a row (sets a tombstone, advances seq); optional `deletedAt` query param |
+| DELETE | `/sync/:app/:entityId` | Soft-delete a row (sets a tombstone, advances seq; idempotent on an already-deleted row); optional `deletedAt` query param |
 
 The device cursor (`POST /sync/:app/device`, body `{ accountId, deviceId,
 lastSeenSeq }`) records how far a device has synced, advancing `last_seen_seq`
@@ -589,6 +589,13 @@ row (as `deletedAt`) so clients can apply tombstone last-writer-wins; when
 omitted it is stored as `null`, which clients read as delete-wins. The server
 only stores and echoes this value — it never orders or merges on it (ordering
 stays purely by `seq`). Live rows always carry `deletedAt: null`.
+
+Deleting a row that is already deleted is idempotent. The existing tombstone is
+returned unchanged — same `seq`, same `serverMtime`, same `deletedAt`, no new
+seq assigned and no nudge emitted — so a client that re-deletes tombstones it
+has drained cannot spin the account's seq. A `deletedAt` sent on such a
+re-delete is ignored: the first tombstone's timestamp is the one every client
+already has. Deleting a row the server has never seen is still a 404.
 
 ### Hit the batch endpoint with curl
 
@@ -679,9 +686,10 @@ Events on the wire:
 Only content writes nudge. Bookkeeping writes never do: the device-cursor
 endpoint (`POST /sync/:app/device`) does not advance `seq` and never nudges, and
 a batch write sent with `notify: false` (used for device-state / high-water-mark
-rows) commits without nudging. This prevents a per-cycle housekeeping write from
-provoking a nudge → drain → housekeep → nudge self-loop, while genuine content
-changes still nudge instantly.
+rows) commits without nudging. A soft-delete of a row that is already deleted
+publishes nothing, so it does not nudge either. This prevents a per-cycle
+housekeeping write from provoking a nudge → drain → housekeep → nudge self-loop,
+while genuine content changes still nudge instantly.
 
 Emission is best-effort and post-commit: a nudge fires only after the write is
 durably committed, and a slow or dead connection is dropped, never allowed to
