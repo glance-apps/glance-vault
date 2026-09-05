@@ -20,13 +20,22 @@ import { authenticatedCredential } from "../middleware/credential-auth.js";
 //   event: ready     — sent once, immediately on connect.
 //                      data: {"seq": <account's current latest seq>}
 //                      Lets a just-connected client reconcile without waiting
-//                      for the next write.
+//                      for the next write. Deliberately carries NO "app": it
+//                      is a reconcile point, not attributable to one writer.
 //   event: activity  — sent on every write that advances the account seq: the
 //                      sync batch-upsert path, the sync soft-delete path, and
 //                      the intents insert path. Sync and intents share ONE
 //                      per-account seq source, so a single "activity" nudge
 //                      covers both; the client drains sync and intents together.
-//                      data: {"seq": <account's latest seq after the write>}
+//                      data: {"seq": <latest seq after the write>, "app": <tag>}
+//                      "app" names the writer: the sync paths carry the
+//                      route's app namespace (e.g. "dayglance"), the intents
+//                      path the fixed tag "intents". It lets a consumer tell
+//                      its own app's rows from another app's on the shared
+//                      seq. Hint only — the nudge still reaches every
+//                      connection on the account, and a consumer that sees no
+//                      "app" (an older server) treats it as unknown and
+//                      drains exactly as before.
 //   : heartbeat      — an SSE comment line (ignored by EventSource) sent
 //                      periodically to keep the connection alive through idle
 //                      proxy/load-balancer timeouts.

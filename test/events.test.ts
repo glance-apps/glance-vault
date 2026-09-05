@@ -463,6 +463,11 @@ test("SSE connect sets stream headers and sends an initial ready event with the 
 
     const ready = await c.nextEvent("ready");
     assert.deepEqual(JSON.parse(ready.data!), { seq: 3 }, "initial event carries the current latest seq");
+    assert.deepEqual(
+      Object.keys(JSON.parse(ready.data!)),
+      ["seq"],
+      "ready is a reconcile point, not attributable to one writer: it carries no app tag",
+    );
     c.close();
   } finally {
     h.close();
@@ -475,6 +480,7 @@ test("a fresh account's initial ready seq is 0", async () => {
     const c = await SseClient.connect(h.base, "brand-new-account");
     const ready = await c.nextEvent("ready");
     assert.deepEqual(JSON.parse(ready.data!), { seq: 0 });
+    assert.equal("app" in JSON.parse(ready.data!), false, "ready stays untagged even for a fresh account");
     c.close();
   } finally {
     h.close();
@@ -495,7 +501,11 @@ test("a subscribed connection is nudged when the account seq advances via a sync
     assert.equal(write.body.maxSeq, 2);
 
     const nudge = await c.nextEvent("activity");
-    assert.deepEqual(JSON.parse(nudge.data!), { seq: 2 }, "the nudge carries the account's latest seq");
+    assert.deepEqual(
+      JSON.parse(nudge.data!),
+      { seq: 2, app: "dayglance" },
+      "the nudge carries the account's latest seq, tagged with the app namespace that was written",
+    );
     c.close();
   } finally {
     h.close();
@@ -517,7 +527,11 @@ test("a subscribed connection is nudged when a sync soft-delete advances the seq
     assert.deepEqual(del.body, { seq: 2 });
 
     const nudge = await c.nextEvent("activity");
-    assert.deepEqual(JSON.parse(nudge.data!), { seq: 2 });
+    assert.deepEqual(
+      JSON.parse(nudge.data!),
+      { seq: 2, app: "dayglance" },
+      "a soft-delete nudge is tagged with the tombstoned row's app namespace",
+    );
     c.close();
   } finally {
     h.close();
@@ -537,7 +551,7 @@ test("a re-delete of an already-deleted row fires no nudge and does not advance 
     const del = await deleteRow(h.base, "dayglance", account, "gone");
     assert.equal(del.status, 200);
     assert.deepEqual(del.body, { seq: 2 });
-    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 2 });
+    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 2, app: "dayglance" });
 
     // Re-deleting the tombstone publishes nothing, so it must not nudge. A
     // nudge here is the seq-churn loop: every connected client is woken to
@@ -569,7 +583,7 @@ test("an unchanged batch re-delete fires no nudge", async () => {
       { entityId: "gone", envelope: tomb, deleted: true },
     ]);
     assert.equal(first.body.maxSeq, 2);
-    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 2 });
+    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 2, app: "dayglance" });
 
     // Re-sending the identical tombstone writes nothing, so maxSeq is 0 and the
     // route's existing `maxSeq > 0` gate already suppresses the nudge. This is
@@ -599,14 +613,47 @@ test("a subscribed connection is nudged when an intent lands", async () => {
     assert.equal(write.body.maxSeq, 1);
 
     const nudge = await c.nextEvent("activity");
-    assert.deepEqual(JSON.parse(nudge.data!), { seq: 1 }, "intents nudge shares the account seq line");
+    assert.deepEqual(
+      JSON.parse(nudge.data!),
+      { seq: 1, app: "intents" },
+      "intents nudge shares the account seq line and carries the fixed \"intents\" tag (no :app param)",
+    );
     c.close();
   } finally {
     h.close();
   }
 });
 
-test("the nudge is signal-only: it carries the seq and no payload/plaintext", async () => {
+test("the app tag follows the namespace that was written: two apps on one account stream carry different tags", async () => {
+  const h = await startServer();
+  try {
+    const account = "acct-apptag-per-namespace";
+    const c = await SseClient.connect(h.base, account);
+    await c.nextEvent("ready");
+
+    // Same account, same seq line, three writers in turn. Each nudge names its
+    // own writer; the seq keeps advancing on the one shared counter.
+    await postBatch(h.base, "dayglance", account, [{ entityId: "d", envelope: garbageEnvelope() }]);
+    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 1, app: "dayglance" });
+
+    await postBatch(h.base, "lifeglance", account, [{ entityId: "l", envelope: garbageEnvelope() }]);
+    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 2, app: "lifeglance" });
+
+    await postIntents(h.base, account, [{ eventId: "ev-x", envelope: garbageEnvelope(), expiresAt: ttl(60) }]);
+    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 3, app: "intents" });
+
+    // A soft-delete in a namespace other than the last writer's is tagged with
+    // the deleted row's namespace, not the most recent one.
+    const del = await deleteRow(h.base, "dayglance", account, "d");
+    assert.equal(del.status, 200);
+    assert.deepEqual(JSON.parse((await c.nextEvent("activity")).data!), { seq: 4, app: "dayglance" });
+    c.close();
+  } finally {
+    h.close();
+  }
+});
+
+test("the nudge is signal-only: it carries the seq and the app tag, and no payload/plaintext", async () => {
   const h = await startServer();
   try {
     const account = "acct-nopayload";
@@ -618,8 +665,13 @@ test("the nudge is signal-only: it carries the seq and no payload/plaintext", as
 
     const nudge = await c.nextEvent("activity");
     const parsed = JSON.parse(nudge.data!) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(parsed), ["seq"], "the only field is seq");
+    assert.deepEqual(
+      Object.keys(parsed).sort(),
+      ["app", "seq"],
+      "the only fields are seq and the app tag — no entityId, no envelope, no row content",
+    );
     assert.equal(typeof parsed.seq, "number");
+    assert.equal(parsed.app, "lastglance", "the tag is the route's app namespace, not a constant");
     // The opaque envelope bytes never appear anywhere in the frame.
     assert.ok(!nudge.data!.includes(secret), "no row content leaks into the nudge");
   } finally {
@@ -643,7 +695,7 @@ test("account isolation: a connection for account A never receives account B's n
 
     // B receives its nudge...
     const nudgeB = await b.nextEvent("activity");
-    assert.deepEqual(JSON.parse(nudgeB.data!), { seq: 1 });
+    assert.deepEqual(JSON.parse(nudgeB.data!), { seq: 1, app: "dayglance" });
     // ...and A receives NOTHING for it (times out with no activity frame).
     await assert.rejects(a.nextEvent("activity", 300), /timed out/, "account A got no cross-account nudge");
 
@@ -801,7 +853,7 @@ test("a bookkeeping batch write (notify:false) commits and advances seq but fire
     ]);
     assert.equal(real.body.maxSeq, 2);
     const nudge = await c.nextEvent("activity");
-    assert.deepEqual(JSON.parse(nudge.data!), { seq: 2 }, "the following content write still nudges");
+    assert.deepEqual(JSON.parse(nudge.data!), { seq: 2, app: "dayglance" }, "the following content write still nudges");
     c.close();
   } finally {
     h.close();
@@ -823,7 +875,7 @@ test("a normal content batch (notify omitted) still nudges instantly", async () 
     ]);
     assert.equal(write.body.maxSeq, 2);
     const nudge = await c.nextEvent("activity");
-    assert.deepEqual(JSON.parse(nudge.data!), { seq: 2 });
+    assert.deepEqual(JSON.parse(nudge.data!), { seq: 2, app: "dayglance" });
     c.close();
   } finally {
     h.close();

@@ -170,8 +170,10 @@ export function syncRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGate)
     if (notify && result.maxSeq > 0) {
       // Keyed by the scope's DERIVED account, not the request's claimed
       // string (Phase 1.3b): byte-equal after a successful resolve, but the
-      // binding is structural rather than by adjacency.
-      emit(scoped.accountId, { seq: result.maxSeq });
+      // binding is structural rather than by adjacency. Tagged with the app
+      // namespace that was written (see Nudge.app) so a consumer can tell its
+      // own app's rows from another's; the seq is shared across apps.
+      emit(scoped.accountId, { seq: result.maxSeq, app });
     }
     res.status(200).json(result);
   });
@@ -305,7 +307,8 @@ export function syncRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGate)
     // connected client into a fetch that returns no new rows, and a client that
     // re-deletes what it drains would keep the loop alive by itself.
     if (!result.alreadyDeleted) {
-      emit(scoped.accountId, { seq: result.seq });
+      // Tagged with the app namespace of the tombstoned row (see Nudge.app).
+      emit(scoped.accountId, { seq: result.seq, app: req.params.app });
     }
     res.status(200).json({ seq: result.seq });
   });

@@ -18,8 +18,19 @@
 // account's latest seq — a signal, never a payload, plaintext, or row content.
 // "account is now at seq N, go sync"; the client compares N to its cursor and
 // drains sync + intents if it is behind.
+//
+// `app` names WHICH writer advanced the seq. The seq is one per-account counter
+// shared across every app namespace, so without it a consumer cannot tell a
+// nudge for its own rows from one for another app's. Sync emits carry the
+// route's app namespace; the intents insert path carries the fixed tag
+// "intents" (intents are account scoped, not namespaced). It is a hint, never a
+// filter the server applies: the nudge still goes to every connection on the
+// account. Optional so a nudge remains valid without it — a consumer treats a
+// missing app as "unknown, drain as before". The `ready` frame deliberately
+// omits it: that is a reconcile point, not attributable to one writer.
 export interface Nudge {
   seq: number;
+  app?: string;
 }
 
 // The best-effort emission callback the write paths call after a write commits.
