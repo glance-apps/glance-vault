@@ -136,8 +136,10 @@ export function intentsRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGa
     // insert-only re-send). Post-commit, best-effort.
     if (result.maxSeq > 0) {
       // Keyed by the scope's derived account (Phase 1.3b), not the claimed
-      // string — same binding as the sync emits.
-      emit(scoped.accountId, { seq: result.maxSeq });
+      // string — same binding as the sync emits. Intents carry no :app path
+      // param (they are account scoped), so the nudge is tagged with the fixed
+      // "intents" namespace (see Nudge.app) rather than a route param.
+      emit(scoped.accountId, { seq: result.maxSeq, app: "intents" });
     }
     res.status(200).json(result);
   });

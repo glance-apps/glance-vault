@@ -684,11 +684,19 @@ Events on the wire:
 
 - `event: ready` — sent once on connect. `data: {"seq": N}` where `N` is the
   account's current latest seq. A just-connected client compares this to its
-  cursor and drains immediately, without waiting for the next write.
+  cursor and drains immediately, without waiting for the next write. It is
+  deliberately untagged (no `app`): a reconcile point is not attributable to
+  one writer.
 - `event: activity` — sent on a **content** write: a sync batch upsert, a sync
-  soft-delete, or a landed intent. `data: {"seq": N}` with the account's latest
-  seq. Sync and intents share one per-account seq, so this single nudge covers
-  both; the client drains sync and intents together.
+  soft-delete, or a landed intent. `data: {"seq": N, "app": "<tag>"}` with the
+  account's latest seq and the writer that advanced it: the sync paths carry
+  the route's app namespace (`dayglance`, `lastglance`, ...), a landed intent
+  carries the fixed tag `intents`. Sync and intents share one per-account seq,
+  so this single nudge covers both; the client drains sync and intents
+  together. `app` is a hint that lets a consumer tell its own app's rows from
+  another app's on that shared seq — the server still delivers every nudge to
+  every connection on the account. A client that sees no `app` (an older
+  server) should treat it as unknown and drain exactly as before.
 - `: heartbeat` — an SSE comment line sent every ~20s to keep the connection
   alive through idle proxy/load-balancer timeouts. Clients ignore it.
 
@@ -721,7 +729,7 @@ curl -N http://localhost:8080/events?accountId=house-1 \
 #
 # ... after another device writes ...
 # event: activity
-# data: {"seq":3}
+# data: {"seq":3,"app":"dayglance"}
 ```
 
 ## Scripts
