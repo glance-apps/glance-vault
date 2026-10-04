@@ -286,6 +286,14 @@ The server port is published on `127.0.0.1` only, so it is reached through a
 TLS-terminating reverse proxy rather than exposed directly. To pick up a new
 image after a push to `main`, run `docker compose pull && docker compose up -d`.
 
+Settings in `.env` reach the server only through the compose file's
+`environment:` block: a `.env` next to a compose file feeds `${...}`
+interpolation, not the container itself. Both compose files map every
+`GLANCEVAULT_*` variable in the [Configuration](#configuration) table as
+`NAME: ${NAME:-}`, so an unset line leaves the server's default in force. After
+editing `.env`, run `docker compose up -d`, not `docker compose restart` —
+restart keeps the container's old environment, so the change never takes effect.
+
 ### Running as a specific user (file permissions)
 
 The SQLite file lives on the mounted data volume, so the container's user has to
