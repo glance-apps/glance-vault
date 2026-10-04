@@ -194,22 +194,24 @@ export function defaultBlobStorePath(storagePath: string): string {
 // itself is supplied via GLANCEVAULT_CONFIG (defaults to ./config.json if
 // present, otherwise file loading is skipped).
 function readFileConfig(): FileConfig {
-  const path = process.env.GLANCEVAULT_CONFIG ?? "./config.json";
+  const requested = blankAsUndefined(process.env.GLANCEVAULT_CONFIG);
+  const path = requested ?? "./config.json";
   try {
     const raw = readFileSync(path, "utf8");
     return JSON.parse(raw) as FileConfig;
   } catch (err) {
     // A missing default config file is fine: env vars alone are enough to run.
     // An explicitly requested file that cannot be read or parsed is fatal.
-    if (process.env.GLANCEVAULT_CONFIG) {
+    if (requested !== undefined) {
       throw new Error(`Could not read config file at ${path}: ${String(err)}`);
     }
     return {};
   }
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): Config {
   const file = readFileConfig();
+  const env = withoutBlankSettings(rawEnv);
 
   const storagePath =
     env.GLANCEVAULT_STORAGE_PATH ?? file.storagePath ?? DEFAULT_STORAGE_PATH;
@@ -426,6 +428,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     uploadSessionTtlMs,
     uploadSessionSweepIntervalMs,
   };
+}
+
+// The compose files pass every optional setting through as `${VAR:-}`, so a
+// variable left out of .env reaches the process as "" rather than being absent.
+// Treat an empty or whitespace-only GLANCEVAULT_* value as unset everywhere, so
+// it falls through to the config file and then the built-in default instead of
+// failing a number parser (or, for TRUST_PROXY / BLOB_STORE_PATH, passing "" on).
+function withoutBlankSettings(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith("GLANCEVAULT_") && blankAsUndefined(value) === undefined) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function blankAsUndefined(value: string | undefined): string | undefined {
+  return value !== undefined && value.trim() !== "" ? value : undefined;
 }
 
 // Resolve an OPTIONAL positive-integer setting: absent everywhere stays
