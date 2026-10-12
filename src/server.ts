@@ -177,7 +177,7 @@ export function buildApp(
   // Protected routes. Phase 1 adds the sync transport; the salt store is a
   // Phase 3 prerequisite; intents are the cross-app transport; Phase 7 adds the
   // content-addressed blob store; Phase 9 adds the SSE real-time push endpoint.
-  app.use("/sync", syncRouter(resolveScope, emit, quotaGate));
+  app.use("/sync", syncRouter(resolveScope, emit, quotaGate, config.allowedApps));
   app.use("/intents", intentsRouter(resolveScope, emit, quotaGate));
   app.use("/salt", saltRouter(resolveScope));
 

@@ -55,6 +55,7 @@ built-in defaults.
 | Listen port | `GLANCEVAULT_PORT` | `port` | `8080` |
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
 | Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
+| Allowed sync apps | `GLANCEVAULT_ALLOWED_APPS` | `allowedApps` | `dayglance,dayglance-bridge,lastglance,lastglance-people,lifeglance` |
 | Request logging | `GLANCEVAULT_REQUEST_LOG` | `requestLog` | on |
 | Trust proxy | `GLANCEVAULT_TRUST_PROXY` | `trustProxy` | `loopback` |
 | Per-IP rate limiting | `GLANCEVAULT_RATE_LIMIT` | `rateLimit` | on |
@@ -75,6 +76,13 @@ over the file. When neither is set, no cross-origin requests are allowed. A
 single `*` entry allows any origin. Preflight OPTIONS requests are answered
 before auth, so browser clients work without sending the device token on the
 preflight.
+
+`GLANCEVAULT_ALLOWED_APPS` is a comma-separated list of the app namespaces that
+may sync (the `{app}` in `/sync/{app}/...`); the `allowedApps` config file field
+is an array. Any other app is rejected with `400 unknown app`. A configured list
+replaces the default rather than adding to it, so list every app you want
+enabled. Names must be lowercase letters, digits and hyphens (up to 64
+characters); a malformed name or an empty list stops the server at startup.
 
 Every client that connects cross-origin must be listed. That includes the
 dayGLANCE **Electron desktop** app, whose renderer sends `Origin: app://dayglance`

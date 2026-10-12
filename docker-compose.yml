@@ -27,6 +27,9 @@ services:
       # Optional: comma-separated browser origins allowed for CORS. Empty by
       # default, which permits no cross-origin requests.
       GLANCEVAULT_ALLOWED_ORIGINS: ${GLANCEVAULT_ALLOWED_ORIGINS:-}
+      # Optional: comma-separated app namespaces allowed to sync. Unset uses the
+      # built-in default (every current GLANCE app). See .env.example.
+      GLANCEVAULT_ALLOWED_APPS: ${GLANCEVAULT_ALLOWED_APPS:-}
       GLANCEVAULT_PORT: "8080"
       GLANCEVAULT_STORAGE_PATH: /data/glancevault.db
       # Optional: auth model, "shared" (default) or "per-account". Per-account

@@ -3,12 +3,7 @@ import type { SyncRowInput, SyncRowRecord } from "../storage/types.js";
 import type { Emit } from "../realtime/hub.js";
 import type { ScopeResolver } from "../scope.js";
 import type { QuotaGate } from "../quotas.js";
-
-// The app namespaces that share this server: the three GLANCE apps plus
-// `dayglance-bridge`, dayGLANCE's Obsidian bridge plugin, which syncs its
-// pairing meta, intent and observation rows under its own namespace. The app
-// path param is validated against this set; anything else is rejected with 400.
-const ALLOWED_APPS = new Set(["dayglance", "dayglance-bridge", "lastglance", "lifeglance"]);
+import { DEFAULT_ALLOWED_APPS } from "../config.js";
 
 const DEFAULT_LIMIT = 500;
 const MAX_LIMIT = 1000;
@@ -57,8 +52,19 @@ function queryAccountId(req: Request): string | null {
 // entities only — updates to existing entities are never blocked. The
 // soft-delete and device-cursor routes below NEVER consult the gate
 // (recovery and tombstone-GC safety), and neither does anything else here.
-export function syncRouter(resolve: ScopeResolver, emit: Emit, gate?: QuotaGate): Router {
+// allowedApps: the app namespaces that share this server (config.allowedApps,
+// GLANCEVAULT_ALLOWED_APPS): the GLANCE apps plus `dayglance-bridge`,
+// dayGLANCE's Obsidian bridge plugin, which syncs its pairing meta, intent and
+// observation rows under its own namespace. The app path param is validated
+// against this set; anything else is rejected with 400.
+export function syncRouter(
+  resolve: ScopeResolver,
+  emit: Emit,
+  gate?: QuotaGate,
+  allowedApps: readonly string[] = DEFAULT_ALLOWED_APPS,
+): Router {
   const router = Router();
+  const ALLOWED_APPS = new Set(allowedApps);
 
   // Validate the app path param once for every route that carries it.
   router.param("app", (_req, res, next, app) => {
