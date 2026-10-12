@@ -40,6 +40,12 @@ export interface Config {
   // Origins allowed for browser CORS requests. Empty means no cross-origin
   // requests are permitted. A single "*" entry allows any origin.
   allowedOrigins: string[];
+  // The app namespaces accepted in the /sync/:app path (the GLANCE apps plus
+  // dayGLANCE's Obsidian bridge). Any other app gets 400. Operator-configurable
+  // so a new GLANCE app can be enabled without a code change. Optional in the
+  // type so test config literals may omit it; loadConfig always resolves a
+  // concrete value, and buildApp falls back to DEFAULT_ALLOWED_APPS.
+  allowedApps?: string[];
   // Directory holding the content-addressed blob store (Phase 7). Defaults to a
   // "blobs" directory alongside the SQLite file. The bytes are opaque ciphertext
   // the server never decrypts. Optional in the type so test config literals may
@@ -131,6 +137,7 @@ interface FileConfig {
   port?: number;
   deviceToken?: string;
   allowedOrigins?: string[];
+  allowedApps?: string[];
   blobStorePath?: string;
   maxBlobSize?: number;
   // Reclaim tunables are expressed in operator-friendly units in the file/env
@@ -155,6 +162,19 @@ interface FileConfig {
 }
 
 const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
+// The app namespaces a server accepts when the operator configures none. An
+// operator list REPLACES this default rather than extending it, so a deployment
+// can also narrow it.
+export const DEFAULT_ALLOWED_APPS: readonly string[] = [
+  "dayglance",
+  "dayglance-bridge",
+  "lastglance",
+  "lastglance-people",
+  "lifeglance",
+];
+// An app name ends up in URLs and in the sync_rows.app column, so keep it to a
+// lowercase slug.
+const APP_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const DEFAULT_PORT = 8080;
 // The shipped self-hosted behavior. Every phase of the per-account work stays
 // inert under this default.
@@ -257,12 +277,38 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): Config {
   const originsEnv = env.GLANCEVAULT_ALLOWED_ORIGINS;
   let allowedOrigins: string[];
   if (originsEnv !== undefined) {
-    allowedOrigins = splitOrigins(originsEnv);
+    allowedOrigins = splitList(originsEnv);
   } else if (Array.isArray(file.allowedOrigins)) {
     allowedOrigins = file.allowedOrigins.map((o) => String(o).trim()).filter((o) => o !== "");
   } else {
     allowedOrigins = [];
   }
+
+  // Allowed sync apps. Same shape and precedence as the CORS origins: a
+  // comma-separated env var, else the config file's array, else the default.
+  // A malformed name or an empty list is fatal at startup: a typo should not
+  // quietly lock a GLANCE app out of sync.
+  const appsEnv = env.GLANCEVAULT_ALLOWED_APPS;
+  let allowedApps: string[];
+  if (appsEnv !== undefined) {
+    allowedApps = splitList(appsEnv);
+  } else if (Array.isArray(file.allowedApps)) {
+    allowedApps = file.allowedApps.map((a) => String(a).trim()).filter((a) => a !== "");
+  } else {
+    allowedApps = [...DEFAULT_ALLOWED_APPS];
+  }
+  for (const app of allowedApps) {
+    if (!APP_NAME_RE.test(app)) {
+      throw new Error(
+        `Invalid app name in GLANCEVAULT_ALLOWED_APPS: "${app}". ` +
+          "Use lowercase letters, digits and hyphens (max 64 characters).",
+      );
+    }
+  }
+  if (allowedApps.length === 0) {
+    throw new Error("GLANCEVAULT_ALLOWED_APPS is empty; list at least one app.");
+  }
+  allowedApps = [...new Set(allowedApps)];
 
   // Blob store directory and the server-side max blob size. Env takes precedence
   // over the config file over the built-in defaults, the same precedence as
@@ -408,6 +454,7 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): Config {
     port,
     deviceToken,
     allowedOrigins,
+    allowedApps,
     blobStorePath,
     maxBlobSize,
     blobReclaim,
@@ -551,7 +598,7 @@ function resolveDuration(
   return Math.round(n * unitMs);
 }
 
-function splitOrigins(value: string): string[] {
+function splitList(value: string): string[] {
   return value
     .split(",")
     .map((o) => o.trim())

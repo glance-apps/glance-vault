@@ -9,6 +9,13 @@
     "app://dayglance",
     "https://app.example.com"
   ],
+  "allowedApps": [
+    "dayglance",
+    "dayglance-bridge",
+    "lastglance",
+    "lastglance-people",
+    "lifeglance"
+  ],
   "blobStorePath": "./data/blobs",
   "maxBlobSize": 1073741824,
   "blobReclaim": false,

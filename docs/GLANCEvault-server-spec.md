@@ -285,7 +285,7 @@ has open implementation details and should not bloat the Phase 0 migrations.
 -- Durable per-entity state. One row per entity, or per event for insert-only types.
 CREATE TABLE sync_rows (
   account_id   TEXT        NOT NULL,   -- household/instance scope; constant for single-tenant self-host
-  app          TEXT        NOT NULL,   -- 'dayglance' | 'dayglance-bridge' | 'lastglance' | 'lifeglance'; plaintext, for per-app fetch
+  app          TEXT        NOT NULL,   -- one of GLANCEVAULT_ALLOWED_APPS (e.g. 'lastglance'); plaintext, for per-app fetch
   entity_id    TEXT        NOT NULL,   -- stable client UUID; idempotency + version key
   seq          BIGINT      NOT NULL,   -- server-assigned, monotonic per account; THE cursor
   envelope     BYTEA       NOT NULL,   -- full Phase 2.7 envelope; server stores opaquely
