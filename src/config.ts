@@ -16,6 +16,8 @@ import { dirname, join } from "node:path";
 //                   exists now so those phases are additions behind a switch
 //                   that already defaults to the shipped behavior.
 export type AuthMode = "shared" | "per-account";
+// How /enroll authenticates a device in per-account mode. See loadConfig.
+export type EnrollmentMode = "bootstrap" | "account-key";
 
 export interface Config {
   // Filesystem path to the SQLite database file. The parent directory is
@@ -33,6 +35,17 @@ export interface Config {
   // deviceToken); ignored in shared mode, where the endpoint is not
   // registered at all. Generate like the device token: openssl rand -hex 32.
   enrollmentSecret?: string;
+  // What a device presents at /enroll in per-account mode. DEFAULT
+  // "bootstrap": the enrollmentSecret above plus a claimed accountId — right
+  // for one household, and what per-account servers ran before this setting
+  // existed. "account-key": a per-account key an operator mints at
+  // POST /admin/accounts, and the server derives the account from it; the
+  // enrollmentSecret then only guards /admin. Required for any server shared
+  // by people who must not reach each other's accounts (GLANCEvault Pro).
+  enrollmentMode?: EnrollmentMode;
+  // Cap on the number of accounts in the registry (account-key mode only).
+  // undefined = no cap.
+  maxAccounts?: number;
   // TCP port the HTTP server listens on.
   port: number;
   // The single valid device auth token (a shared secret). Required.
@@ -134,6 +147,8 @@ interface FileConfig {
   // here (a hand-edited JSON file can hold anything).
   authMode?: string;
   enrollmentSecret?: string;
+  enrollmentMode?: string;
+  maxAccounts?: number;
   port?: number;
   deviceToken?: string;
   allowedOrigins?: string[];
@@ -180,6 +195,8 @@ const DEFAULT_PORT = 8080;
 // inert under this default.
 export const DEFAULT_AUTH_MODE: AuthMode = "shared";
 const AUTH_MODES: AuthMode[] = ["shared", "per-account"];
+export const DEFAULT_ENROLLMENT_MODE: EnrollmentMode = "bootstrap";
+const ENROLLMENT_MODES: EnrollmentMode[] = ["bootstrap", "account-key"];
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Reclaim defaults. RETAIN (off) is the safe default; the grace and dead-device
 // windows match spec section 8.3.
@@ -270,6 +287,22 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): Config {
         "generate one like the device token, e.g. openssl rand -hex 32.",
     );
   }
+
+  // Enrollment mode. Strict like AUTH_MODE: a typo silently falling back to
+  // "bootstrap" would reopen any-account enrollment on a shared server.
+  // account-key only means something in per-account mode, so asking for it on
+  // a shared-mode server is a misconfiguration and fatal rather than ignored.
+  const enrollmentMode = normalizeEnrollmentMode(env.GLANCEVAULT_ENROLLMENT_MODE ?? file.enrollmentMode);
+  if (enrollmentMode === "account-key" && authMode !== "per-account") {
+    throw new Error(
+      "GLANCEVAULT_ENROLLMENT_MODE=account-key requires GLANCEVAULT_AUTH_MODE=per-account.",
+    );
+  }
+  const maxAccounts = resolveOptionalCount(
+    env.GLANCEVAULT_MAX_ACCOUNTS,
+    file.maxAccounts,
+    "GLANCEVAULT_MAX_ACCOUNTS",
+  );
 
   // Allowed CORS origins. The env var is a comma-separated list and takes
   // precedence over the config file's allowedOrigins array. Absent both, no
@@ -451,6 +484,8 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): Config {
     storagePath,
     authMode,
     enrollmentSecret,
+    enrollmentMode,
+    maxAccounts,
     port,
     deviceToken,
     allowedOrigins,
@@ -537,6 +572,23 @@ function normalizeAuthMode(raw: string | undefined): AuthMode {
   if (!match) {
     throw new Error(
       `Invalid GLANCEVAULT_AUTH_MODE: ${raw}. Expected one of: ${AUTH_MODES.join(", ")}.`,
+    );
+  }
+  return match;
+}
+
+// Resolve the enrollment mode, with the same rules as normalizeAuthMode:
+// whitespace-only is unset, matching is trimmed and case-insensitive, and an
+// unrecognized value is fatal.
+function normalizeEnrollmentMode(raw: string | undefined): EnrollmentMode {
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_ENROLLMENT_MODE;
+  }
+  const value = raw.trim().toLowerCase();
+  const match = ENROLLMENT_MODES.find((mode) => mode === value);
+  if (!match) {
+    throw new Error(
+      `Invalid GLANCEVAULT_ENROLLMENT_MODE: ${raw}. Expected one of: ${ENROLLMENT_MODES.join(", ")}.`,
     );
   }
   return match;

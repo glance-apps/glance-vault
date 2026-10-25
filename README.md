@@ -167,6 +167,47 @@ re-enrolling always mints a fresh credential rather than returning an old one.
 `shared` deployments are unaffected: switching modes is an explicit operator
 decision, and enrolled credentials mean nothing to a `shared`-mode server.
 
+#### Per-account enrollment keys (`GLANCEVAULT_ENROLLMENT_MODE=account-key`)
+
+The bootstrap secret above enrolls a device into whatever account it names.
+That is right for one household, and wrong for a server shared by people who
+must not reach each other's data: anyone holding the secret could enroll into
+someone else's account. On such a server (GLANCEvault Pro, or a self-hoster
+hosting friends), set `GLANCEVAULT_ENROLLMENT_MODE=account-key`. Each account
+then gets its own key, and the server decides the account from the key:
+
+```
+# Create an account (the operator; same bootstrap-secret auth as /admin).
+curl -X POST https://vault.example.com/admin/accounts \
+  -H 'Authorization: Bearer <the bootstrap secret>' \
+  -H 'Content-Type: application/json' -d '{"label":"Daniel"}'
+# -> 201 {"accountId":"acct_...","label":"Daniel","createdAt":"...","keyRotatedAt":null,"accountKey":"gvk_..."}
+
+# A device enrolls with the key alone and learns its account from the reply.
+curl -X POST https://vault.example.com/enroll \
+  -H 'Content-Type: application/json' \
+  -d '{"accountKey":"gvk_...","deviceId":"kitchen-tablet"}'
+# -> 201 {"credentialId":"...","credential":"gvc_...","accountId":"acct_...",...}
+```
+
+- The key appears once, in the create (or rotate) response; the server stores
+  only its hash. Hand it to the account holder; each of their devices pastes
+  it once and discards it after enrolling.
+- A device may send `accountId` alongside the key; if it is not the key's
+  account, enrollment is refused with `403`. The bootstrap secret no longer
+  enrolls anything in this mode; it only guards `/admin`.
+- `GET /admin/accounts` lists accounts (never keys) and the cap.
+  `GLANCEVAULT_MAX_ACCOUNTS` caps how many can be created (`409` past it).
+- `POST /admin/accounts` accepts an optional `accountId` to adopt an id that
+  already holds data, such as a household that enrolled in bootstrap mode.
+- `POST /admin/accounts/<accountId>/rotate-key` issues a new key and retires
+  the old one; the account and its data are untouched, and the new key resumes
+  the same account. Send `{"revokeDevices":true}` to also sign out every device
+  on the account, the step to take when a key has leaked.
+
+Credentials enrolled before switching to this mode keep working; revoke them
+through the endpoint below if they should not.
+
 #### Revoking a credential (per-account mode)
 
 Two admin endpoints exist only in `per-account` mode, authenticated with the

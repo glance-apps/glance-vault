@@ -1,7 +1,8 @@
 import { Router, json, type Request, type Response } from "express";
-import type { CredentialIssuer } from "../storage/types.js";
+import type { AccountKeyResolver, CredentialIssuer } from "../storage/types.js";
 import { timingSafeStringEqual } from "../middleware/auth.js";
 import { mintCredential } from "../credentials.js";
+import { hashAccountKey } from "../account-keys.js";
 
 // Enrollment: a device exchanges the admin-configured bootstrap secret for its
 // own per-device credential bound to an account (Phase 1.2).
@@ -32,56 +33,105 @@ import { mintCredential } from "../credentials.js";
 // tombstone-GC arithmetic cannot be perturbed by any enrollment activity.
 
 // THE SWAPPABLE SEAM (the phase plan's step 1 of validate/mint/persist/
-// respond): "does this presented proof entitle the caller to enroll into
-// accountId?" Today the proof is the one configured bootstrap secret and the
-// claimed accountId is not consulted. The Pro path replaces THIS FUNCTION with
-// a purchased-license-key lookup — at which point it will also want to RETURN
-// the account the key is bound to instead of trusting the claim, a one-
-// signature change contained here. Mint, persist, and the response shape do
-// not move.
-export type EnrollmentValidator = (presentedSecret: string, accountId: string) => boolean;
+// respond): "does this presented proof entitle the caller to enroll, and into
+// WHICH account?" The validator owns the proof fields of the body and returns
+// the operative account, or the rejection. Mint, persist, and the response
+// shape do not move between validators.
+//
+//   bootstrapSecretValidator  the self-host proof: the one configured secret,
+//                             and the account is the one the caller claims.
+//                             Right for one household; on a shared server it
+//                             lets any secret holder enroll into any account.
+//   accountKeyValidator       the hosted proof (GLANCEVAULT_ENROLLMENT_MODE=
+//                             account-key): a per-account key, and the account
+//                             is the one the SERVER has bound to that key. The
+//                             caller's claim is never trusted; a mismatched
+//                             one is rejected. The Pro license key drops in
+//                             here unchanged.
+export interface EnrollmentProof {
+  enrollmentSecret?: unknown;
+  accountKey?: unknown;
+  accountId?: unknown;
+}
+
+export type EnrollmentDecision =
+  | { ok: true; accountId: string }
+  | { ok: false; status: 400 | 401 | 403; error: string };
+
+export type EnrollmentValidator = (proof: EnrollmentProof) => EnrollmentDecision;
+
+// Field-shape helper: non-empty strings, byte-exact — no trimming or
+// normalization, matching the account-id semantics everywhere else.
+function isPresent(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
+}
 
 export function bootstrapSecretValidator(configuredSecret: string): EnrollmentValidator {
-  return (presentedSecret, _accountId) => timingSafeStringEqual(presentedSecret, configuredSecret);
+  return (proof) => {
+    if (!isPresent(proof.enrollmentSecret)) {
+      return { ok: false, status: 400, error: "enrollmentSecret is required" };
+    }
+    if (!isPresent(proof.accountId)) {
+      return { ok: false, status: 400, error: "accountId is required" };
+    }
+    if (!timingSafeStringEqual(proof.enrollmentSecret, configuredSecret)) {
+      return { ok: false, status: 401, error: "invalid enrollment secret" };
+    }
+    return { ok: true, accountId: proof.accountId };
+  };
+}
+
+// The bootstrap secret is NOT accepted here, in either field: in this mode it
+// is the operator's admin secret only, and accepting it at /enroll would
+// reopen the any-account hole this validator exists to close. accountId is
+// optional; a client that sends one learns at once if it pasted the wrong key.
+export function accountKeyValidator(resolver: AccountKeyResolver): EnrollmentValidator {
+  return (proof) => {
+    if (!isPresent(proof.accountKey)) {
+      return { ok: false, status: 400, error: "accountKey is required" };
+    }
+    // Unique-index point read on the hash; as with credential verification,
+    // index timing reveals nothing actionable about other stored hashes.
+    const account = resolver.getAccountByKeyHash(hashAccountKey(proof.accountKey));
+    if (account === null) {
+      return { ok: false, status: 401, error: "invalid account key" };
+    }
+    if (proof.accountId !== undefined && proof.accountId !== account.accountId) {
+      return { ok: false, status: 403, error: "accountId does not match the account key" };
+    }
+    return { ok: true, accountId: account.accountId };
+  };
 }
 
 export function enrollRouter(issuer: CredentialIssuer, validate: EnrollmentValidator): Router {
   const router = Router();
 
   // POST /enroll
-  // Body: { enrollmentSecret, accountId, deviceId } — the secret rides in the
-  // body, never the query string (query strings appear in proxy logs).
+  // Body: { enrollmentSecret, accountId, deviceId } (bootstrap mode) or
+  // { accountKey, deviceId, accountId? } (account-key mode). The proof rides
+  // in the body, never the query string (query strings appear in proxy logs).
   // Success: 201 { credentialId, credential, accountId, deviceId, createdAt }.
   // The credential value appears in this response ONCE and is never
-  // retrievable again (the server stores only its hash).
+  // retrievable again (the server stores only its hash). accountId in the
+  // response is the operative account; in account-key mode it is how the
+  // device learns which account to name on every later request.
   router.post("/", json({ limit: "16kb" }), (req: Request, res: Response) => {
-    const body = req.body as {
-      enrollmentSecret?: unknown;
-      accountId?: unknown;
-      deviceId?: unknown;
-    };
+    const body = (req.body ?? {}) as EnrollmentProof & { deviceId?: unknown };
 
-    // Field-shape validation first (400), exactly like every other router:
-    // non-empty strings, byte-exact — no trimming or normalization, matching
-    // the account-id semantics everywhere else in the server.
-    if (typeof body.enrollmentSecret !== "string" || body.enrollmentSecret.trim() === "") {
-      res.status(400).json({ error: "enrollmentSecret is required" });
+    // Step 1: validate the enrollment proof (the swappable seam). Proof-field
+    // shape errors (400) come from the validator, so each mode names its own
+    // fields; deviceId is common to both and checked after.
+    const decision = validate(body);
+    if (!decision.ok) {
+      res.status(decision.status).json({ error: decision.error });
       return;
     }
-    if (typeof body.accountId !== "string" || body.accountId.trim() === "") {
-      res.status(400).json({ error: "accountId is required" });
-      return;
-    }
-    if (typeof body.deviceId !== "string" || body.deviceId.trim() === "") {
+    if (!isPresent(body.deviceId)) {
       res.status(400).json({ error: "deviceId is required" });
       return;
     }
-
-    // Step 1: validate the enrollment proof (the swappable seam).
-    if (!validate(body.enrollmentSecret, body.accountId)) {
-      res.status(401).json({ error: "invalid enrollment secret" });
-      return;
-    }
+    const accountId = decision.accountId;
+    const deviceId = body.deviceId;
 
     // Steps 2–4: mint fresh, persist the hash (superseding any still-active
     // predecessor for this byte-exact (accountId, deviceId) — Phase 2.1 turns
@@ -90,8 +140,8 @@ export function enrollRouter(issuer: CredentialIssuer, validate: EnrollmentValid
     const minted = mintCredential();
     const record = issuer.issueCredential({
       credentialId: minted.credentialId,
-      accountId: body.accountId,
-      deviceId: body.deviceId,
+      accountId,
+      deviceId,
       credentialHash: minted.credentialHash,
     });
 

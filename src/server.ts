@@ -7,8 +7,8 @@ import { deviceTokenAuth } from "./middleware/auth.js";
 import { makeScopeResolver, ScopeError } from "./scope.js";
 import { makeQuotaGate } from "./quotas.js";
 import { credentialAuth } from "./middleware/credential-auth.js";
-import { enrollRouter, bootstrapSecretValidator } from "./routes/enroll.js";
-import { adminRouter, bootstrapAdminGuard } from "./routes/admin.js";
+import { enrollRouter, bootstrapSecretValidator, accountKeyValidator } from "./routes/enroll.js";
+import { accountsAdminRouter, adminRouter, bootstrapAdminGuard } from "./routes/admin.js";
 import { cors } from "./middleware/cors.js";
 import { requestLog } from "./middleware/request-log.js";
 import { rateLimit } from "./middleware/rate-limit.js";
@@ -108,7 +108,31 @@ export function buildApp(
   // account data, credential reads, or the sweeps. loadConfig guarantees
   // enrollmentSecret is set whenever authMode is "per-account".
   if (config.authMode === "per-account") {
-    app.use("/enroll", enrollRouter(store, bootstrapSecretValidator(config.enrollmentSecret!)));
+    // Which proof /enroll accepts is the one choice made here. In
+    // account-key mode the account comes from the presented key, so no
+    // holder of any secret can enroll into an account they were not given,
+    // and the account registry's admin surface is registered alongside
+    // (mounted before /admin so its own guard answers for it). Bootstrap
+    // mode registers exactly what it always did.
+    const accountKeys = config.enrollmentMode === "account-key";
+    app.use(
+      "/enroll",
+      enrollRouter(
+        store,
+        accountKeys ? accountKeyValidator(store) : bootstrapSecretValidator(config.enrollmentSecret!),
+      ),
+    );
+    if (accountKeys) {
+      app.use(
+        "/admin/accounts",
+        accountsAdminRouter(
+          store,
+          bootstrapAdminGuard(config.enrollmentSecret!),
+          (credentialId) => accountHub.disconnectCredential(credentialId),
+          config.maxAccounts,
+        ),
+      );
+    }
     // Credential administration (Phase 2.1), same gating and mount segment as
     // /enroll and guarded by the same bootstrap secret (which already grants
     // enrollment into any account, so revocation grants strictly less — no

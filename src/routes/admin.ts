@@ -1,6 +1,7 @@
-import { Router, type Request, type Response } from "express";
-import type { CredentialAdmin, UsageReporter } from "../storage/types.js";
+import { Router, json, type NextFunction, type Request, type Response } from "express";
+import type { AccountAdmin, AccountRecord, CredentialAdmin, UsageReporter } from "../storage/types.js";
 import { timingSafeStringEqual } from "../middleware/auth.js";
+import { mintAccountKey, newAccountId } from "../account-keys.js";
 
 // Credential administration (Phase 2.1): how an operator actually revokes.
 //
@@ -31,6 +32,25 @@ export type AdminGuard = (presentedSecret: string) => boolean;
 
 export function bootstrapAdminGuard(configuredSecret: string): AdminGuard {
   return (presentedSecret) => timingSafeStringEqual(presentedSecret, configuredSecret);
+}
+
+// Bearer auth with the bootstrap secret, same header shape as everything
+// else. Same rejection bodies as the credential middleware for the same
+// conditions: header problems are header problems in both places. Shared by
+// every admin router.
+function adminAuth(authorize: AdminGuard) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const header = req.get("authorization");
+    if (!header || !header.startsWith("Bearer ")) {
+      res.status(401).json({ error: "missing or malformed Authorization header" });
+      return;
+    }
+    if (!authorize(header.slice("Bearer ".length))) {
+      res.status(401).json({ error: "invalid enrollment secret" });
+      return;
+    }
+    next();
+  };
 }
 
 // Serialize one credential row for the listing/revoke responses. EXPLICIT
@@ -74,21 +94,7 @@ export function adminRouter(
 ): Router {
   const router = Router();
 
-  // Bearer auth with the bootstrap secret, same header shape as everything
-  // else. Same rejection bodies as the credential middleware for the same
-  // conditions: header problems are header problems in both places.
-  router.use((req: Request, res: Response, next) => {
-    const header = req.get("authorization");
-    if (!header || !header.startsWith("Bearer ")) {
-      res.status(401).json({ error: "missing or malformed Authorization header" });
-      return;
-    }
-    if (!authorize(header.slice("Bearer ".length))) {
-      res.status(401).json({ error: "invalid enrollment secret" });
-      return;
-    }
-    next();
-  });
+  router.use(adminAuth(authorize));
 
   // GET /admin/credentials — every credential, active and revoked, in
   // deterministic order. Revoked-but-lingering rows and the pre-2.1 orphans
@@ -172,6 +178,128 @@ export function adminRouter(
     );
 
     res.status(200).json({ accounts, totals });
+  });
+
+  return router;
+}
+
+// Account administration (enrollment-key mode): how an operator hands out
+// access on a shared server. Registered ONLY when GLANCEVAULT_ENROLLMENT_MODE
+// is account-key, mounted at /admin/accounts, and guarded by the same
+// bootstrap secret as the rest of /admin. In that mode the secret no longer
+// enrolls devices, so it is purely the operator's secret.
+//
+// The router receives only the AccountAdmin surface. Account keys appear in a
+// create or rotate response ONCE and are never retrievable again (the server
+// stores only their hash); the listing never carries a key or a hash.
+
+// Bounds on operator-supplied strings. Generous, but they keep a typo'd paste
+// of a whole file out of the registry.
+const MAX_ACCOUNT_ID_LENGTH = 128;
+const MAX_LABEL_LENGTH = 200;
+
+function serializeAccount(record: AccountRecord) {
+  return {
+    accountId: record.accountId,
+    label: record.label,
+    createdAt: record.createdAt,
+    keyRotatedAt: record.keyRotatedAt,
+  };
+}
+
+export function accountsAdminRouter(
+  accounts: AccountAdmin,
+  authorize: AdminGuard,
+  // Called with each credential a rotation revoked, after the transaction
+  // commits; buildApp wires it to hub.disconnectCredential, as for /revoke.
+  onRevoked: (credentialId: string) => void,
+  // The registry cap (GLANCEVAULT_MAX_ACCOUNTS); undefined means no cap.
+  maxAccounts: number | undefined,
+): Router {
+  const router = Router();
+  router.use(adminAuth(authorize));
+
+  // POST /admin/accounts — body { label?, accountId? }. accountId defaults to
+  // a fresh server-generated id; supplying one adopts an id that already holds
+  // data (say, a household that enrolled under bootstrap mode) without moving
+  // a row. 201 { accountId, label, createdAt, keyRotatedAt, accountKey }.
+  router.post("/", json({ limit: "16kb" }), (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { label?: unknown; accountId?: unknown };
+
+    let label: string | null = null;
+    if (body.label !== undefined && body.label !== null) {
+      if (typeof body.label !== "string" || body.label.length > MAX_LABEL_LENGTH) {
+        res.status(400).json({ error: `label must be a string of at most ${MAX_LABEL_LENGTH} characters` });
+        return;
+      }
+      label = body.label;
+    }
+
+    let accountId: string;
+    if (body.accountId !== undefined) {
+      if (
+        typeof body.accountId !== "string" ||
+        body.accountId.trim() === "" ||
+        body.accountId.length > MAX_ACCOUNT_ID_LENGTH
+      ) {
+        res.status(400).json({
+          error: `accountId must be a non-empty string of at most ${MAX_ACCOUNT_ID_LENGTH} characters`,
+        });
+        return;
+      }
+      accountId = body.accountId;
+    } else {
+      accountId = newAccountId();
+    }
+
+    const minted = mintAccountKey();
+    const result = accounts.createAccount({ accountId, label, keyHash: minted.keyHash }, maxAccounts);
+    if (result === "exists") {
+      res.status(409).json({ error: "account already exists" });
+      return;
+    }
+    if (result === "limit") {
+      res.status(409).json({ error: "account limit reached", maxAccounts });
+      return;
+    }
+    res.status(201).json({ ...serializeAccount(result), accountKey: minted.accountKey });
+  });
+
+  // GET /admin/accounts — every account plus the cap, so an operator can see
+  // how many places are left.
+  router.get("/", (_req: Request, res: Response) => {
+    res.status(200).json({
+      accounts: accounts.listAccounts().map(serializeAccount),
+      maxAccounts: maxAccounts ?? null,
+    });
+  });
+
+  // POST /admin/accounts/:accountId/rotate-key — body { revokeDevices? }.
+  // Mints a new key; the old one stops enrolling immediately. Account data is
+  // never touched. revokeDevices: true also signs out every device of the
+  // account (the containment step for a leaked key, since a leaked key may
+  // already have enrolled a device). 200 { ...account, accountKey,
+  // revokedCredentials }; 404 for an unknown account.
+  router.post("/:accountId/rotate-key", json({ limit: "16kb" }), (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { revokeDevices?: unknown };
+    if (body.revokeDevices !== undefined && typeof body.revokeDevices !== "boolean") {
+      res.status(400).json({ error: "revokeDevices must be a boolean" });
+      return;
+    }
+    const minted = mintAccountKey();
+    const result = accounts.rotateAccountKey(req.params.accountId, minted.keyHash, body.revokeDevices === true);
+    if (result === null) {
+      res.status(404).json({ error: "unknown account" });
+      return;
+    }
+    for (const credentialId of result.revokedCredentialIds) {
+      onRevoked(credentialId);
+    }
+    res.status(200).json({
+      ...serializeAccount(result.record),
+      accountKey: minted.accountKey,
+      revokedCredentials: result.revokedCredentialIds.length,
+    });
   });
 
   return router;

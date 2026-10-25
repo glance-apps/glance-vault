@@ -12,7 +12,8 @@ import type Database from "better-sqlite3";
 // version 5 adds the per-device credential store, which is STORAGE ONLY at this
 // phase — nothing reads or writes it yet; version 6 adds the nullable
 // device_credentials.revoked_at revocation flag (Phase 2.1) — NULL means
-// active, a timestamp means the credential no longer authenticates.
+// active, a timestamp means the credential no longer authenticates; version 7
+// adds the accounts registry that per-account enrollment keys resolve through.
 //
 // envelope is an opaque BLOB. The server stores and returns these bytes intact
 // and never parses them.
@@ -242,6 +243,39 @@ const MIGRATIONS: Migration[] = [
       -- multiple concurrent credentials per device were legal), surfaced
       -- instead by the admin listing for explicit operator revocation.
       ALTER TABLE device_credentials ADD COLUMN revoked_at TEXT;
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      -- The account registry for per-account enrollment keys
+      -- (GLANCEVAULT_ENROLLMENT_MODE=account-key). An operator mints an account
+      -- and its key; a device presents the key at /enroll and the SERVER reads
+      -- the account it is bound to here, rather than trusting a claimed one.
+      -- Unused in every other mode: nothing reads or writes it there.
+      --
+      -- IDENTITY CONSTRAINT (pro-prerequisites item 6): account_id is the
+      -- stable identity and the key only MAPS TO it. Rotation replaces
+      -- key_hash and leaves account_id, and therefore every account-scoped row,
+      -- untouched. Nothing may use key_hash as an account key.
+      --
+      --   account_id      same identity space as sync_rows, device_credentials.
+      --   label           operator note (who the account is for). Never sent
+      --                   to devices.
+      --   key_hash        SHA-256 of the key; the key itself is never stored.
+      --   created_at      ISO timestamp.
+      --   key_rotated_at  ISO timestamp of the latest rotation, NULL if never.
+      CREATE TABLE accounts (
+        account_id     TEXT NOT NULL PRIMARY KEY,
+        label          TEXT,
+        key_hash       TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        key_rotated_at TEXT
+      );
+
+      -- Lookup by presented key, and a guarantee that a key resolves to at
+      -- most one account.
+      CREATE UNIQUE INDEX idx_accounts_key_hash ON accounts (key_hash);
     `,
   },
 ];
