@@ -2,6 +2,8 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import type {
+  AccountRecord,
+  CreateAccountRefusal,
   Store,
   AccountStore,
   AccountUsage,
@@ -131,6 +133,24 @@ function toCredentialRecord(row: CredentialRowDb): CredentialRecord {
     credentialHash: row.credential_hash,
     createdAt: row.created_at,
     revokedAt: row.revoked_at ?? null,
+  };
+}
+
+// Shape of an accounts row as it comes back from better-sqlite3 (key_hash is
+// never selected into a record).
+interface AccountRowDb {
+  account_id: string;
+  label: string | null;
+  created_at: string;
+  key_rotated_at: string | null;
+}
+
+function toAccountRecord(row: AccountRowDb): AccountRecord {
+  return {
+    accountId: row.account_id,
+    label: row.label ?? null,
+    createdAt: row.created_at,
+    keyRotatedAt: row.key_rotated_at ?? null,
   };
 }
 
@@ -878,6 +898,103 @@ export class SqliteStore implements Store {
       return null;
     }
     return { record, revokedNow: info.changes > 0 };
+  }
+
+  // --- Account registry (enrollment-key mode) — root-level auth metadata ---
+
+  // Cap check and insert in ONE transaction: SQLite's single writer then
+  // makes "count < max, insert" atomic. Touches no table but accounts and
+  // consumes no account seq.
+  createAccount(
+    input: { accountId: string; label: string | null; keyHash: string },
+    maxAccounts?: number,
+  ): AccountRecord | CreateAccountRefusal {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const existing = this.db
+        .prepare(`SELECT 1 FROM accounts WHERE account_id = ?`)
+        .get(input.accountId);
+      if (existing !== undefined) {
+        return "exists" as const;
+      }
+      if (maxAccounts !== undefined) {
+        const { n } = this.db.prepare(`SELECT COUNT(*) AS n FROM accounts`).get() as { n: number };
+        if (n >= maxAccounts) {
+          return "limit" as const;
+        }
+      }
+      this.db
+        .prepare(
+          `INSERT INTO accounts (account_id, label, key_hash, created_at, key_rotated_at)
+           VALUES (?, ?, ?, ?, NULL)`,
+        )
+        .run(input.accountId, input.label, input.keyHash, now);
+      return { accountId: input.accountId, label: input.label, createdAt: now, keyRotatedAt: null };
+    });
+  }
+
+  listAccounts(): AccountRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT account_id, label, created_at, key_rotated_at
+         FROM accounts ORDER BY created_at, account_id`,
+      )
+      .all() as AccountRowDb[];
+    return rows.map(toAccountRecord);
+  }
+
+  // One transaction: rebind the key, and with revokeDevices stamp revoked_at
+  // on every still-active credential of the account. The device_credentials
+  // update is the same idempotent "WHERE revoked_at IS NULL" stamp as
+  // revokeCredential, so already-revoked rows keep their original timestamp;
+  // the devices cursor rows are never touched (see revokeCredential).
+  rotateAccountKey(
+    accountId: string,
+    keyHash: string,
+    revokeDevices: boolean,
+  ): { record: AccountRecord; revokedCredentialIds: string[] } | null {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const info = this.db
+        .prepare(`UPDATE accounts SET key_hash = ?, key_rotated_at = ? WHERE account_id = ?`)
+        .run(keyHash, now, accountId);
+      if (info.changes === 0) {
+        return null;
+      }
+      let revokedCredentialIds: string[] = [];
+      if (revokeDevices) {
+        revokedCredentialIds = (
+          this.db
+            .prepare(
+              `SELECT credential_id FROM device_credentials
+               WHERE account_id = ? AND revoked_at IS NULL ORDER BY credential_id`,
+            )
+            .all(accountId) as { credential_id: string }[]
+        ).map((r) => r.credential_id);
+        this.db
+          .prepare(
+            `UPDATE device_credentials SET revoked_at = ?
+             WHERE account_id = ? AND revoked_at IS NULL`,
+          )
+          .run(now, accountId);
+      }
+      const row = this.db
+        .prepare(
+          `SELECT account_id, label, created_at, key_rotated_at FROM accounts WHERE account_id = ?`,
+        )
+        .get(accountId) as AccountRowDb;
+      return { record: toAccountRecord(row), revokedCredentialIds };
+    });
+  }
+
+  // Unique-index point read for the enrollment validator.
+  getAccountByKeyHash(keyHash: string): AccountRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT account_id, label, created_at, key_rotated_at FROM accounts WHERE key_hash = ?`,
+      )
+      .get(keyHash) as AccountRowDb | undefined;
+    return row ? toAccountRecord(row) : null;
   }
 
   // --- Usage reporting (Phase 3.1) — derived, read-only, aggregate-only ---

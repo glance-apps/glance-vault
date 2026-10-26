@@ -41,6 +41,8 @@ services:
       # Required only when GLANCEVAULT_AUTH_MODE=per-account: the bootstrap
       # secret devices exchange for per-device credentials at POST /enroll.
       GLANCEVAULT_ENROLLMENT_SECRET: ${GLANCEVAULT_ENROLLMENT_SECRET:-}
+      GLANCEVAULT_ENROLLMENT_MODE: ${GLANCEVAULT_ENROLLMENT_MODE:-}
+      GLANCEVAULT_MAX_ACCOUNTS: ${GLANCEVAULT_MAX_ACCOUNTS:-}
       # Optional per-account quotas (unset = no enforcement). See .env.example.
       GLANCEVAULT_QUOTA_STORAGE_MB: ${GLANCEVAULT_QUOTA_STORAGE_MB:-}
       GLANCEVAULT_QUOTA_ROWS: ${GLANCEVAULT_QUOTA_ROWS:-}

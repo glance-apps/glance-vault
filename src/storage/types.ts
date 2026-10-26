@@ -375,6 +375,55 @@ export interface CredentialAdmin {
   revokeCredential(credentialId: string): { record: CredentialRecord; revokedNow: boolean } | null;
 }
 
+// One row of the account registry (enrollment-key mode). The key hash is
+// deliberately absent from the record: no caller above the store has a use for
+// it, so it cannot leak through a listing by accident.
+export interface AccountRecord {
+  accountId: string;
+  label: string | null;
+  createdAt: string;
+  keyRotatedAt: string | null;
+}
+
+// Why createAccount refused. "exists": the requested accountId is already in
+// the registry. "limit": the registry already holds maxAccounts accounts.
+export type CreateAccountRefusal = "exists" | "limit";
+
+// The account-administration surface (enrollment-key mode) — the ONLY storage
+// object the account admin router receives. Same narrow-interface discipline
+// as CredentialAdmin: forAccount, the sweeps, issuance and lifecycle are not
+// expressible there. The registry is auth metadata (an account and the hash of
+// the key that maps to it), not account data.
+export interface AccountAdmin {
+  // Insert an account bound to keyHash. When maxAccounts is set, the count
+  // and the insert run in one transaction, so two concurrent creates cannot
+  // both slip under the cap. Consumes no account seq.
+  createAccount(
+    input: { accountId: string; label: string | null; keyHash: string },
+    maxAccounts?: number,
+  ): AccountRecord | CreateAccountRefusal;
+
+  // Every account, ordered by created_at then account_id.
+  listAccounts(): AccountRecord[];
+
+  // Rebind the account to a new key hash; the old key stops enrolling at once.
+  // account_id and every account-scoped row are untouched. With revokeDevices,
+  // the same transaction revokes every active credential of the account and
+  // returns their ids (so the caller can close their SSE streams); otherwise
+  // enrolled devices keep working. null for an unknown accountId.
+  rotateAccountKey(
+    accountId: string,
+    keyHash: string,
+    revokeDevices: boolean,
+  ): { record: AccountRecord; revokedCredentialIds: string[] } | null;
+}
+
+// The read half of enrollment-key mode: which account does a presented key
+// map to? The enrollment validator holds only this.
+export interface AccountKeyResolver {
+  getAccountByKeyHash(keyHash: string): AccountRecord | null;
+}
+
 // One account's usage snapshot (Phase 3.1) — DERIVED, CURRENT-STATE aggregates.
 // Nothing here is a lifetime/throughput figure: pruned intents and reclaimed
 // blobs are unrecoverable history, and a counter starting at zero would be
@@ -506,7 +555,13 @@ export interface QuotaReader {
 //
 // SQLite is the only implementation; a Postgres implementation can be added
 // later by satisfying this same contract without touching any handler code.
-export interface Store extends CredentialIssuer, CredentialAdmin, UsageReporter, QuotaReader {
+export interface Store
+  extends CredentialIssuer,
+    CredentialAdmin,
+    AccountAdmin,
+    AccountKeyResolver,
+    UsageReporter,
+    QuotaReader {
   // Apply any pending migrations. Safe to call on every boot; a no-op once the
   // database is already at the current schema version.
   migrate(): void;
