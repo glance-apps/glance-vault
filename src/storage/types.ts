@@ -416,6 +416,24 @@ export interface AccountAdmin {
     keyHash: string,
     revokeDevices: boolean,
   ): { record: AccountRecord; revokedCredentialIds: string[] } | null;
+
+  // Remove the account and every account-scoped row in one transaction: sync
+  // rows, intents, device cursors, seq, salt, blob rows, upload sessions,
+  // credentials, and the registry entry, which frees its place under the cap.
+  // Blob BYTES live outside the database, so the caller deletes them after
+  // the commit: blobHashes lists only hashes no other account still holds.
+  // credentialIds are the account's active credentials (for closing their SSE
+  // streams); uploadIds are the staged sessions to discard. null for an
+  // unknown accountId.
+  deleteAccount(accountId: string): DeletedAccount | null;
+}
+
+export interface DeletedAccount {
+  record: AccountRecord;
+  deletedRows: number;
+  credentialIds: string[];
+  blobHashes: string[];
+  uploadIds: string[];
 }
 
 // The read half of enrollment-key mode: which account does a presented key

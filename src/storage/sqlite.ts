@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import type {
   AccountRecord,
   CreateAccountRefusal,
+  DeletedAccount,
   Store,
   AccountStore,
   AccountUsage,
@@ -984,6 +985,55 @@ export class SqliteStore implements Store {
         )
         .get(accountId) as AccountRowDb;
       return { record: toAccountRecord(row), revokedCredentialIds };
+    });
+  }
+
+  deleteAccount(accountId: string): DeletedAccount | null {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare(
+          `SELECT account_id, label, created_at, key_rotated_at FROM accounts WHERE account_id = ?`,
+        )
+        .get(accountId) as AccountRowDb | undefined;
+      if (row === undefined) {
+        return null;
+      }
+      const column = (sql: string, name: string) =>
+        (this.db.prepare(sql).all(accountId) as Record<string, string>[]).map((r) => r[name]);
+      const credentialIds = column(
+        `SELECT credential_id FROM device_credentials
+         WHERE account_id = ? AND revoked_at IS NULL ORDER BY credential_id`,
+        "credential_id",
+      );
+      const accountHashes = column(`SELECT blob_hash FROM blobs WHERE account_id = ?`, "blob_hash");
+      const uploadIds = column(
+        `SELECT upload_id FROM blob_upload_sessions WHERE account_id = ?`,
+        "upload_id",
+      );
+
+      const { changes: deletedRows } = this.db
+        .prepare(`DELETE FROM sync_rows WHERE account_id = ?`)
+        .run(accountId);
+      // blob_upload_parts go with their sessions (ON DELETE CASCADE).
+      for (const table of [
+        "intent_events",
+        "devices",
+        "account_seq",
+        "account_salts",
+        "blobs",
+        "blob_upload_sessions",
+        "device_credentials",
+        "accounts",
+      ]) {
+        this.db.prepare(`DELETE FROM ${table} WHERE account_id = ?`).run(accountId);
+      }
+
+      // The blob store is content-addressed across accounts, so bytes another
+      // account still references stay.
+      const stillHeld = this.db.prepare(`SELECT 1 FROM blobs WHERE blob_hash = ? LIMIT 1`);
+      const blobHashes = accountHashes.filter((hash) => stillHeld.get(hash) === undefined);
+
+      return { record: toAccountRecord(row), deletedRows, credentialIds, blobHashes, uploadIds };
     });
   }
 
