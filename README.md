@@ -204,6 +204,10 @@ curl -X POST https://vault.example.com/enroll \
   the old one; the account and its data are untouched, and the new key resumes
   the same account. Send `{"revokeDevices":true}` to also sign out every device
   on the account, the step to take when a key has leaked.
+- `DELETE /admin/accounts/<accountId>` with `{"confirm":"<accountId>"}`
+  deletes the account and all of its data (sync rows, intents, media), signs
+  its devices out, and frees its place under the cap. It cannot be undone
+  except from your own backups.
 
 Credentials enrolled before switching to this mode keep working; revoke them
 through the endpoint below if they should not.

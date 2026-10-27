@@ -10,6 +10,7 @@ import { SqliteStore } from "../src/storage/sqlite.js";
 import { buildApp } from "../src/server.js";
 import { loadConfig, type EnrollmentMode } from "../src/config.js";
 import { ACCOUNT_KEY_PREFIX, hashAccountKey } from "../src/account-keys.js";
+import type { BlobStore } from "../src/storage/blobstore.js";
 
 // Enrollment-key mode: a per-account key, minted by the operator, decides the
 // account a device enrolls into. The adversarial cases are the point: on a
@@ -28,6 +29,7 @@ interface Harness {
 async function startServer(opts: {
   enrollmentMode?: EnrollmentMode;
   maxAccounts?: number;
+  blobStore?: BlobStore;
 } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), "glancevault-account-keys-"));
   const dbPath = join(dir, "test.db");
@@ -45,6 +47,7 @@ async function startServer(opts: {
       maxAccounts: opts.maxAccounts,
     },
     store,
+    opts.blobStore,
   );
   const server: Server = await new Promise((resolve) => {
     const s = app.listen(0, () => resolve(s));
@@ -406,6 +409,115 @@ test("rotating an unknown account is a 404; a non-boolean revokeDevices is a 400
       body: { revokeDevices: "yes" },
     });
     assert.equal(bad.status, 400);
+  } finally {
+    h.close();
+  }
+});
+
+// --- Admin: delete an account ---
+
+// Records what the delete asks of the blob store; nothing else is exercised.
+function recordingBlobStore() {
+  const deleted: string[] = [];
+  const discarded: string[] = [];
+  const unused = () => {
+    throw new Error("not used by these tests");
+  };
+  const store: BlobStore = {
+    exists: () => false,
+    stat: () => null,
+    readRange: unused,
+    put: unused,
+    delete: (hash) => void deleted.push(hash),
+    writePart: unused,
+    assemble: unused,
+    discardSession: (uploadId) => void discarded.push(uploadId),
+  };
+  return { store, deleted, discarded };
+}
+
+function insertBlob(dbPath: string, accountId: string, hash: string) {
+  const db = new Database(dbPath);
+  try {
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO blobs (account_id, blob_hash, size, ref_count, zero_ref_seq, created_at, last_reference_activity_at)
+       VALUES (?, ?, 1, 0, NULL, ?, ?)`,
+    ).run(accountId, hash, now, now);
+    db.prepare(
+      `INSERT INTO blob_upload_sessions (upload_id, account_id, blob_hash, declared_size, created_at)
+       VALUES (?, ?, ?, 1, ?)`,
+    ).run(`up-${accountId}-${hash}`, accountId, hash, now);
+  } finally {
+    db.close();
+  }
+}
+
+test("deleting an account removes all of its data, signs its devices out and frees its place", async () => {
+  const blobs = recordingBlobStore();
+  const h = await startServer({ maxAccounts: 2, blobStore: blobs.store });
+  try {
+    const a = await provision(h.base, "phone");
+    const b = await provision(h.base, "phone");
+    assert.equal((await writeRow(h.base, a.credential, a.accountId, "task-1")).status, 200);
+    assert.equal((await writeRow(h.base, b.credential, b.accountId, "task-1")).status, 200);
+    insertBlob(h.dbPath, a.accountId, "only-a");
+    insertBlob(h.dbPath, a.accountId, "shared");
+    insertBlob(h.dbPath, b.accountId, "shared");
+    assert.equal((await createAccount(h.base)).status, 409, "the cap is full");
+
+    const deleted = await call(h.base, "DELETE", `/admin/accounts/${a.accountId}`, {
+      bearer: SECRET,
+      body: { confirm: a.accountId },
+    });
+    assert.equal(deleted.status, 200);
+    assert.equal(deleted.body.accountId, a.accountId);
+    assert.equal(deleted.body.deletedRows, 1);
+    assert.equal(deleted.body.revokedCredentials, 1);
+    assert.equal(deleted.body.deletedBlobs, 1);
+    assert.deepEqual(blobs.deleted, ["only-a"], "bytes another account holds stay");
+    assert.deepEqual(blobs.discarded.sort(), [`up-${a.accountId}-only-a`, `up-${a.accountId}-shared`]);
+
+    for (const table of [
+      "sync_rows", "intent_events", "devices", "account_seq", "account_salts",
+      "blobs", "blob_upload_sessions", "device_credentials", "accounts",
+    ]) {
+      assert.equal(
+        countRows(h.dbPath, `SELECT COUNT(*) AS n FROM ${table} WHERE account_id = '${a.accountId}'`),
+        0,
+        `${table} holds nothing of the deleted account`,
+      );
+    }
+    assert.equal((await listRows(h.base, a.credential, a.accountId)).status, 401, "its device is signed out");
+    assert.equal((await enroll(h.base, { accountKey: a.accountKey, deviceId: "laptop" })).status, 401, "its key no longer enrolls");
+
+    const listB = await listRows(h.base, b.credential, b.accountId);
+    assert.equal(listB.status, 200);
+    assert.deepEqual((listB.body.rows as Json[]).map((r) => r.entityId), ["task-1"], "account B is untouched");
+    assert.equal(countRows(h.dbPath, `SELECT COUNT(*) AS n FROM blobs WHERE account_id = '${b.accountId}'`), 1);
+
+    assert.equal((await createAccount(h.base)).status, 201, "the place is free again");
+  } finally {
+    h.close();
+  }
+});
+
+test("deleting needs the secret and a confirm repeating the id; an unknown account is a 404", async () => {
+  const h = await startServer();
+  try {
+    const a = await provision(h.base, "phone");
+    const path = `/admin/accounts/${a.accountId}`;
+    assert.equal((await call(h.base, "DELETE", path, { body: { confirm: a.accountId } })).status, 401);
+    assert.equal(
+      (await call(h.base, "DELETE", path, { bearer: a.credential, body: { confirm: a.accountId } })).status,
+      401,
+    );
+    assert.equal((await call(h.base, "DELETE", path, { bearer: SECRET })).status, 400);
+    assert.equal((await call(h.base, "DELETE", path, { bearer: SECRET, body: { confirm: "other" } })).status, 400);
+    assert.equal((await listRows(h.base, a.credential, a.accountId)).status, 200, "nothing was deleted");
+
+    const missing = await call(h.base, "DELETE", "/admin/accounts/nope", { bearer: SECRET, body: { confirm: "nope" } });
+    assert.equal(missing.status, 404);
   } finally {
     h.close();
   }

@@ -2,6 +2,7 @@ import { Router, json, type NextFunction, type Request, type Response } from "ex
 import type { AccountAdmin, AccountRecord, CredentialAdmin, UsageReporter } from "../storage/types.js";
 import { timingSafeStringEqual } from "../middleware/auth.js";
 import { mintAccountKey, newAccountId } from "../account-keys.js";
+import type { BlobStore } from "../storage/blobstore.js";
 
 // Credential administration (Phase 2.1): how an operator actually revokes.
 //
@@ -215,6 +216,8 @@ export function accountsAdminRouter(
   onRevoked: (credentialId: string) => void,
   // The registry cap (GLANCEVAULT_MAX_ACCOUNTS); undefined means no cap.
   maxAccounts: number | undefined,
+  // Where blob bytes live, so deleting an account can remove its media.
+  blobs: BlobStore,
 ): Router {
   const router = Router();
   router.use(adminAuth(authorize));
@@ -299,6 +302,43 @@ export function accountsAdminRouter(
       ...serializeAccount(result.record),
       accountKey: minted.accountKey,
       revokedCredentials: result.revokedCredentialIds.length,
+    });
+  });
+
+  // DELETE /admin/accounts/:accountId — body { confirm: "<accountId>" }.
+  // Removes the account and ALL of its data (sync rows, intents, media,
+  // devices), signs its devices out, and frees its place under the cap.
+  // Irreversible apart from the operator's own backups, hence the confirm
+  // field, which must repeat the id. 200 { ...account, deletedRows,
+  // revokedCredentials, deletedBlobs }; 404 for an unknown account.
+  router.delete("/:accountId", json({ limit: "16kb" }), (req: Request, res: Response) => {
+    const accountId = req.params.accountId;
+    const body = (req.body ?? {}) as { confirm?: unknown };
+    if (body.confirm !== accountId) {
+      res.status(400).json({ error: "confirm must repeat the accountId being deleted" });
+      return;
+    }
+    const result = accounts.deleteAccount(accountId);
+    if (result === null) {
+      res.status(404).json({ error: "unknown account" });
+      return;
+    }
+    for (const credentialId of result.credentialIds) {
+      onRevoked(credentialId);
+    }
+    // After the commit, the bytes the database no longer references. Both
+    // calls are idempotent, so a failure here leaves only unreferenced files.
+    for (const uploadId of result.uploadIds) {
+      blobs.discardSession(uploadId);
+    }
+    for (const hash of result.blobHashes) {
+      blobs.delete(hash);
+    }
+    res.status(200).json({
+      ...serializeAccount(result.record),
+      deletedRows: result.deletedRows,
+      revokedCredentials: result.credentialIds.length,
+      deletedBlobs: result.blobHashes.length,
     });
   });
 

@@ -107,6 +107,9 @@ export function buildApp(
   // the narrow CredentialIssuer surface — it structurally cannot reach
   // account data, credential reads, or the sweeps. loadConfig guarantees
   // enrollmentSecret is set whenever authMode is "per-account".
+  // Built before the admin routers: deleting an account removes its media.
+  const blobs = blobStore ?? new DiskBlobStore(config.blobStorePath ?? defaultBlobStorePath(config.storagePath));
+
   if (config.authMode === "per-account") {
     // Which proof /enroll accepts is the one choice made here. In
     // account-key mode the account comes from the presented key, so no
@@ -130,6 +133,7 @@ export function buildApp(
           bootstrapAdminGuard(config.enrollmentSecret!),
           (credentialId) => accountHub.disconnectCredential(credentialId),
           config.maxAccounts,
+          blobs,
         ),
       );
     }
@@ -170,7 +174,6 @@ export function buildApp(
   // and non-blocking by contract, so a push failure can never affect a write.
   const emit: Emit = (accountId, nudge) => accountHub.publish(accountId, nudge);
 
-  const blobs = blobStore ?? new DiskBlobStore(config.blobStorePath ?? defaultBlobStorePath(config.storagePath));
   const maxBlobSize = config.maxBlobSize ?? DEFAULT_MAX_BLOB_SIZE;
 
   // The scope resolver (Phase 1.3a): the ONLY path from a request to account
