@@ -8,6 +8,7 @@ import type { Server } from "node:http";
 import { SqliteStore } from "../src/storage/sqlite.js";
 import { buildApp } from "../src/server.js";
 import { SCHEMA_VERSION, SERVER_VERSION } from "../src/version.js";
+import { DEFAULT_ALLOWED_APPS } from "../src/config.js";
 
 // Phase 1.4a: /healthz advertises the auth mode so a client can discover it
 // before enrolling. The endpoint is public in both modes; the body gains one
@@ -18,7 +19,7 @@ interface Harness {
   close: () => void;
 }
 
-async function startServer(authMode?: "shared" | "per-account"): Promise<Harness> {
+async function startServer(authMode?: "shared" | "per-account", allowedApps?: string[]): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), "glancevault-healthz-"));
   const path = join(dir, "test.db");
   const store = new SqliteStore(path);
@@ -31,6 +32,7 @@ async function startServer(authMode?: "shared" | "per-account"): Promise<Harness
       allowedOrigins: [],
       authMode,
       enrollmentSecret: authMode === "per-account" ? "boot-secret" : undefined,
+      allowedApps,
     },
     store,
   );
@@ -60,9 +62,10 @@ test("/healthz reports authMode 'shared' by default, unauthenticated, with the e
       version: SERVER_VERSION,
       schemaVersion: SCHEMA_VERSION,
       authMode: "shared",
+      allowedApps: [...DEFAULT_ALLOWED_APPS],
     });
-    // authMode is appended LAST, after schemaVersion.
-    assert.deepEqual(Object.keys(body as object), ["status", "version", "schemaVersion", "authMode"]);
+    // authMode follows schemaVersion; allowedApps is appended last.
+    assert.deepEqual(Object.keys(body as object), ["status", "version", "schemaVersion", "authMode", "allowedApps"]);
   } finally {
     h.close();
   }
@@ -78,6 +81,7 @@ test("/healthz reports authMode 'per-account', unauthenticated", async () => {
       version: SERVER_VERSION,
       schemaVersion: SCHEMA_VERSION,
       authMode: "per-account",
+      allowedApps: [...DEFAULT_ALLOWED_APPS],
     });
   } finally {
     h.close();
@@ -96,5 +100,19 @@ test("authMode is the only field that differs between the two modes", async () =
   } finally {
     shared.close();
     perAccount.close();
+  }
+});
+
+test("/healthz lists the apps /sync accepts, so a rollout can be checked without a credential", async () => {
+  const defaults = await startServer("per-account");
+  const configured = await startServer("per-account", ["lastglance", "dayglance"]);
+  try {
+    const a = (await (await fetch(`${defaults.base}/healthz`)).json()) as { allowedApps: string[] };
+    assert.ok(a.allowedApps.includes("glance-users"), "the shared roster is in the default list");
+    const b = (await (await fetch(`${configured.base}/healthz`)).json()) as { allowedApps: string[] };
+    assert.deepEqual(b.allowedApps, ["lastglance", "dayglance"], "a configured list is reported as configured");
+  } finally {
+    defaults.close();
+    configured.close();
   }
 });
