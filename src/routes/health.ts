@@ -1,6 +1,6 @@
 import { Router } from "express";
 import type { Store } from "../storage/types.js";
-import type { AuthMode } from "../config.js";
+import { DEFAULT_ALLOWED_APPS, type AuthMode } from "../config.js";
 import { SERVER_VERSION } from "../version.js";
 
 // GET /healthz. No auth required (mounted before every auth middleware in both
@@ -20,7 +20,17 @@ import { SERVER_VERSION } from "../version.js";
 // this only makes explicit what is already trivially discoverable — and the
 // field is the mode string ONLY, never whether an enrollment secret is set,
 // credential counts, or any other auth state.
-export function healthRouter(store: Store, authMode: AuthMode): Router {
+//
+// allowedApps (appended after authMode) is the app namespaces /sync accepts,
+// so an operator can confirm a rollout (say, that a hosted server accepts the
+// shared glance-users roster) by opening this URL, with no device credential.
+// The names are not secret: the default list ships in the README, and every
+// signed-in device is told the list by any 400 "unknown app".
+export function healthRouter(
+  store: Store,
+  authMode: AuthMode,
+  allowedApps: readonly string[] = DEFAULT_ALLOWED_APPS,
+): Router {
   const router = Router();
 
   router.get("/healthz", (_req, res) => {
@@ -29,6 +39,7 @@ export function healthRouter(store: Store, authMode: AuthMode): Router {
       version: SERVER_VERSION,
       schemaVersion: store.schemaVersion(),
       authMode,
+      allowedApps: [...allowedApps],
     });
   });
 

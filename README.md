@@ -85,7 +85,7 @@ enabled. Names must be lowercase letters, digits and hyphens (up to 64
 characters); a malformed name or an empty list stops the server at startup.
 `glance-users` is the household roster the GLANCE apps share (one row per
 member); a deployment that sets its own list must include it, or members added
-in one app never reach the others.
+in one app never reach the others. `GET /healthz` reports the list in effect.
 
 Every client that connects cross-origin must be listed. That includes the
 dayGLANCE **Electron desktop** app, whose renderer sends `Origin: app://dayglance`
@@ -603,13 +603,16 @@ curl http://localhost:8080/healthz
 Expected response:
 
 ```json
-{ "status": "ok", "version": "0.1.0", "schemaVersion": 6, "authMode": "shared" }
+{ "status": "ok", "version": "0.1.0", "schemaVersion": 6, "authMode": "shared",
+  "allowedApps": ["dayglance", "dayglance-bridge", "glance-users", "lastglance", "lastglance-people", "lifeglance"] }
 ```
 
 `authMode` is the server's configured auth model — `"shared"` or `"per-account"`,
 the same strings as `GLANCEVAULT_AUTH_MODE` — so a client can discover which
-setup flow a server needs before enrolling. The endpoint stays public and needs
-no token in either mode.
+setup flow a server needs before enrolling. `allowedApps` is the list of app
+namespaces `/sync` accepts (see `GLANCEVAULT_ALLOWED_APPS`), so you can confirm
+a server takes an app, the shared `glance-users` roster for one, by opening this
+URL in a browser. The endpoint stays public and needs no token in either mode.
 
 ## Sync transport endpoints
 

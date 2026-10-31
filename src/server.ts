@@ -95,7 +95,7 @@ export function buildApp(
     );
   }
 
-  app.use(healthRouter(store, config.authMode ?? "shared"));
+  app.use(healthRouter(store, config.authMode ?? "shared", config.allowedApps));
 
   // Enrollment (Phase 1.2): REGISTERED ONLY IN PER-ACCOUNT MODE, so a
   // shared-mode server is byte-identical to one where this route does not
