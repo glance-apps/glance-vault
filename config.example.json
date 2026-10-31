@@ -12,6 +12,7 @@
   "allowedApps": [
     "dayglance",
     "dayglance-bridge",
+    "glance-users",
     "lastglance",
     "lastglance-people",
     "lifeglance"
