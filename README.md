@@ -55,7 +55,7 @@ built-in defaults.
 | Listen port | `GLANCEVAULT_PORT` | `port` | `8080` |
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
 | Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
-| Allowed sync apps | `GLANCEVAULT_ALLOWED_APPS` | `allowedApps` | `dayglance,dayglance-bridge,lastglance,lastglance-people,lifeglance` |
+| Allowed sync apps | `GLANCEVAULT_ALLOWED_APPS` | `allowedApps` | `dayglance,dayglance-bridge,glance-users,lastglance,lastglance-people,lifeglance` |
 | Request logging | `GLANCEVAULT_REQUEST_LOG` | `requestLog` | on |
 | Trust proxy | `GLANCEVAULT_TRUST_PROXY` | `trustProxy` | `loopback` |
 | Per-IP rate limiting | `GLANCEVAULT_RATE_LIMIT` | `rateLimit` | on |
@@ -83,6 +83,9 @@ is an array. Any other app is rejected with `400 unknown app`. A configured list
 replaces the default rather than adding to it, so list every app you want
 enabled. Names must be lowercase letters, digits and hyphens (up to 64
 characters); a malformed name or an empty list stops the server at startup.
+`glance-users` is the household roster the GLANCE apps share (one row per
+member); a deployment that sets its own list must include it, or members added
+in one app never reach the others.
 
 Every client that connects cross-origin must be listed. That includes the
 dayGLANCE **Electron desktop** app, whose renderer sends `Origin: app://dayglance`

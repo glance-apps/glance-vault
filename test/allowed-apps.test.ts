@@ -18,7 +18,7 @@ function env(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
 
 test("allowed apps default to every current GLANCE app", () => {
   assert.deepEqual(loadConfig(env()).allowedApps, [...DEFAULT_ALLOWED_APPS]);
-  for (const app of ["dayglance", "dayglance-bridge", "lastglance", "lastglance-people", "lifeglance"]) {
+  for (const app of ["dayglance", "dayglance-bridge", "glance-users", "lastglance", "lastglance-people", "lifeglance"]) {
     assert.ok(DEFAULT_ALLOWED_APPS.includes(app), `${app} is in the default`);
   }
 });
@@ -91,6 +91,7 @@ async function listStatus(base: string, app: string): Promise<number> {
 test("lastglance-people syncs on a server with no app config", async () => {
   await withServer(undefined, async (base) => {
     assert.equal(await listStatus(base, "lastglance-people"), 200);
+    assert.equal(await listStatus(base, "glance-users"), 200);
     assert.equal(await listStatus(base, "lastglance"), 200);
     assert.equal(await listStatus(base, "bogus"), 400);
   });

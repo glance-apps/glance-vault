@@ -183,6 +183,10 @@ const DEFAULT_STORAGE_PATH = "./data/glancevault.db";
 export const DEFAULT_ALLOWED_APPS: readonly string[] = [
   "dayglance",
   "dayglance-bridge",
+  // The household roster every GLANCE app shares: one row per member, keyed by
+  // the member's sync id. Its own app because the roster is not any one app's
+  // data, and each app's own namespace keeps its rows to itself.
+  "glance-users",
   "lastglance",
   "lastglance-people",
   "lifeglance",
