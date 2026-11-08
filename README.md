@@ -594,6 +594,32 @@ check the server side with request logging (on by default, see
 [Configuration](#configuration)) — if no line is logged when the client acts,
 the request never left the browser, which points at one of the two rules above.
 
+#### "Test connection" passes but sync reports `KEY_MISMATCH`
+
+`KEY_MISMATCH` ("This sync passphrase doesn't match this account's existing
+data") comes from the app, not the server. The server stores each account's
+salt and a key-check row per app, both first-write-wins and never changed
+afterwards; it never sees the passphrase or the key. The app derives a key from
+the passphrase and that salt and tries to open the key check; this error means
+it could not. A passing connection test only proves the URL, token and CORS
+are right.
+
+Work through it in this order:
+
+1. **Same account.** Every device must use the same account id. A different
+   id is a different account with its own salt and key check.
+2. **Same passphrase as the first setup.** The passphrase that counts is the
+   one entered on the first device that synced this account, not the most
+   recent one. If another device (or another browser on the same machine)
+   syncs fine, it holds the right passphrase.
+3. **Stale keys in one browser.** If one browser fails while a fresh browser
+   with the same passphrase works, the failing one is holding an old saved
+   key. Use the app's option to re-enter the passphrase if it has one.
+4. **Last resort: clear that browser's site data** for the app's domain and
+   set sync up again. Do this only after confirming another device has
+   everything synced: clearing site data deletes anything that browser has not
+   uploaded yet, including queued intents.
+
 ## Hit /healthz
 
 ```
