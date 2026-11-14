@@ -190,6 +190,7 @@ export const DEFAULT_ALLOWED_APPS: readonly string[] = [
   "lastglance",
   "lastglance-people",
   "lifeglance",
+  "thingglance",
 ];
 // An app name ends up in URLs and in the sync_rows.app column, so keep it to a
 // lowercase slug.

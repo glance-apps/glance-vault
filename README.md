@@ -55,7 +55,7 @@ built-in defaults.
 | Listen port | `GLANCEVAULT_PORT` | `port` | `8080` |
 | Device auth token | `GLANCEVAULT_DEVICE_TOKEN` | `deviceToken` | none (required) |
 | Allowed CORS origins | `GLANCEVAULT_ALLOWED_ORIGINS` | `allowedOrigins` | none (no cross-origin) |
-| Allowed sync apps | `GLANCEVAULT_ALLOWED_APPS` | `allowedApps` | `dayglance,dayglance-bridge,glance-users,lastglance,lastglance-people,lifeglance` |
+| Allowed sync apps | `GLANCEVAULT_ALLOWED_APPS` | `allowedApps` | `dayglance,dayglance-bridge,glance-users,lastglance,lastglance-people,lifeglance,thingglance` |
 | Request logging | `GLANCEVAULT_REQUEST_LOG` | `requestLog` | on |
 | Trust proxy | `GLANCEVAULT_TRUST_PROXY` | `trustProxy` | `loopback` |
 | Per-IP rate limiting | `GLANCEVAULT_RATE_LIMIT` | `rateLimit` | on |
@@ -630,7 +630,7 @@ Expected response:
 
 ```json
 { "status": "ok", "version": "0.1.0", "schemaVersion": 6, "authMode": "shared",
-  "allowedApps": ["dayglance", "dayglance-bridge", "glance-users", "lastglance", "lastglance-people", "lifeglance"] }
+  "allowedApps": ["dayglance", "dayglance-bridge", "glance-users", "lastglance", "lastglance-people", "lifeglance", "thingglance"] }
 ```
 
 `authMode` is the server's configured auth model — `"shared"` or `"per-account"`,
@@ -643,8 +643,9 @@ URL in a browser. The endpoint stays public and needs no token in either mode.
 ## Sync transport endpoints
 
 All sync endpoints sit under `/sync` and require the device token. The `:app`
-path segment must be one of `dayglance`, `dayglance-bridge`, `lastglance`, or
-`lifeglance`; anything else is rejected with 400. (`dayglance-bridge` is the
+path segment must be one of the allowed apps (`GLANCEVAULT_ALLOWED_APPS`; by
+default every current GLANCE app, as `/healthz` lists them); anything else is
+rejected with 400. (`dayglance-bridge` is the
 namespace for dayGLANCE's Obsidian bridge plugin, which syncs its own rows
 alongside dayGLANCE proper.) The `envelope` field is opaque bytes: base64-encoded
 on the wire and stored as a BLOB the server never parses.
