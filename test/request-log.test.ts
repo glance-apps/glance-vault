@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import express from "express";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { requestLog, redactPath } from "../src/middleware/request-log.js";
+import { buildApp } from "../src/server.js";
+import { SqliteStore } from "../src/storage/sqlite.js";
 
 interface Harness {
   base: string;
@@ -119,5 +124,109 @@ test("does not log health-check requests", async () => {
     assert.equal(h.lines.length, 0);
   } finally {
     h.close();
+  }
+});
+
+test("redactPath names /enroll and /admin routes and redacts their ids", () => {
+  assert.equal(redactPath("/enroll"), "/enroll");
+  assert.equal(redactPath("/enroll/extra"), "/enroll/:seg");
+  assert.equal(redactPath("/admin/accounts"), "/admin/accounts");
+  assert.equal(redactPath("/admin/accounts/house-1"), "/admin/accounts/:accountId");
+  assert.equal(redactPath("/admin/accounts/house-1/rotate-key"), "/admin/accounts/:accountId/rotate-key");
+  assert.equal(redactPath("/admin/accounts/house-1/other"), "/admin/accounts/:accountId/:seg");
+  assert.equal(redactPath("/admin/credentials"), "/admin/credentials");
+  assert.equal(redactPath("/admin/credentials/cred-123/revoke"), "/admin/credentials/:credentialId/revoke");
+  assert.equal(redactPath("/admin/credentials/cred-123"), "/admin/credentials/:credentialId");
+  assert.equal(redactPath("/admin/usage"), "/admin/usage");
+  assert.equal(redactPath("/admin/usage/house-1"), "/admin/usage/:seg");
+  // Unknown admin sub-paths are redacted wholesale.
+  assert.equal(redactPath("/admin/house-1"), "/admin/:seg");
+  assert.equal(redactPath("/admin"), "/admin");
+});
+
+test("end to end: enrollment and admin traffic is logged without account or credential ids", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glancevault-request-log-"));
+  const dbPath = join(dir, "test.db");
+  const store = new SqliteStore(dbPath);
+  store.migrate();
+  const SECRET = "request-log-test-bootstrap-secret";
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  };
+  let server: Server | undefined;
+  try {
+    const app = buildApp(
+      {
+        storagePath: dbPath,
+        port: 0,
+        deviceToken: "request-log-test-device-token",
+        allowedOrigins: [],
+        authMode: "per-account",
+        enrollmentSecret: SECRET,
+        enrollmentMode: "account-key",
+        requestLog: true,
+      },
+      store,
+    );
+    server = await new Promise<Server>((resolve) => {
+      const s = app.listen(0, () => resolve(s));
+    });
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+    const admin = { Authorization: `Bearer ${SECRET}`, "Content-Type": "application/json" };
+    const post = (path: string, headers: Record<string, string>, body: unknown) =>
+      fetch(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+
+    const accountId = "tester-household-alpha";
+    const deviceId = "tester-phone-bravo";
+    const created = await post("/admin/accounts", admin, { accountId, label: "Tester A" });
+    assert.equal(created.status, 201);
+    const { accountKey } = (await created.json()) as { accountKey: string };
+
+    const bad = await post("/enroll", { "Content-Type": "application/json" }, { accountKey: "wrong", deviceId });
+    await bad.text();
+    const good = await post("/enroll", { "Content-Type": "application/json" }, { accountKey, deviceId });
+    assert.equal(good.status, 201);
+    const { credentialId } = (await good.json()) as { credentialId: string };
+
+    for (const path of ["/admin/accounts", "/admin/credentials", "/admin/usage"]) {
+      const r = await fetch(`${base}${path}`, { headers: admin });
+      await r.text();
+    }
+    await (await post(`/admin/credentials/${credentialId}/revoke`, admin, {})).text();
+    await (await post(`/admin/accounts/${accountId}/rotate-key`, admin, {})).text();
+    const del = await fetch(`${base}/admin/accounts/${accountId}`, {
+      method: "DELETE",
+      headers: admin,
+      body: JSON.stringify({ confirm: accountId }),
+    });
+    assert.equal(del.status, 200);
+    await del.text();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const requests = lines.filter((l) => /^(GET|POST|DELETE) \//.test(l)).map((l) => l.replace(/ [\d.]+ms$/, ""));
+    assert.deepEqual(requests, [
+      "POST /admin/accounts 201",
+      `POST /enroll ${bad.status}`,
+      "POST /enroll 201",
+      "GET /admin/accounts 200",
+      "GET /admin/credentials 200",
+      "GET /admin/usage 200",
+      "POST /admin/credentials/:credentialId/revoke 200",
+      "POST /admin/accounts/:accountId/rotate-key 200",
+      "DELETE /admin/accounts/:accountId 200",
+    ]);
+    // No secret, key, or identifier from these requests reaches any log line.
+    const all = lines.join("\n");
+    for (const secretish of [accountId, deviceId, credentialId, accountKey, SECRET, "Tester A"]) {
+      assert.ok(!all.includes(secretish), `log leaked ${secretish}`);
+    }
+  } finally {
+    console.log = originalLog;
+    server?.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
