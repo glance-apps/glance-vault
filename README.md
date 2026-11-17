@@ -115,7 +115,12 @@ stripped — a request to `/sync/dayglance/dailyNotes:2026-07-10?accountId=house
 logs as `GET /sync/:app/:entityId` — so no per-user metadata reaches the logs.
 This is the first thing to check when a client "does nothing" — if no line
 appears when the client acts, the request never reached the server (see
-[Connecting a browser app](#connecting-a-browser-app)). Set
+[Connecting a browser app](#connecting-a-browser-app)). Enrollment and admin
+calls are named too, with account and credential ids redacted: a device
+enrolling logs as `POST /enroll 201` (or `403` for a key that matches no
+account), and a key rotation as `POST /admin/accounts/:accountId/rotate-key`,
+so `docker compose logs glancevault | grep 'POST /enroll'` shows whether anyone
+has tried to enroll. Set
 `GLANCEVAULT_REQUEST_LOG=off` to silence it.
 
 ### The device token

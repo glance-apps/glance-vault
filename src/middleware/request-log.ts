@@ -27,7 +27,7 @@ import type { Request, Response, NextFunction } from "express";
 
 // Collapse a concrete request path into a stable route template with no
 // user-identifying segments. Rules mirror the mounted routers (sync, intents,
-// salt, blobs, events); an unrecognized shape is redacted conservatively rather
+// salt, blobs, events, enroll, admin); an unrecognized shape is redacted conservatively rather
 // than logged raw. Operates on req.path only (never the query string).
 export function redactPath(path: string): string {
   // Split into non-empty segments; keep a leading "/" on the rebuilt template.
@@ -91,6 +91,37 @@ export function redactPath(path: string): string {
       out.push("events");
       for (let i = 1; i < parts.length; i++) out.push(":seg");
       break;
+    case "enroll":
+      // POST /enroll — a fixed path with nothing user-identifying in it (the
+      // account key and deviceId ride in the body, which is never logged).
+      // Named so an operator can see enrollment attempts and their status.
+      out.push("enroll");
+      for (let i = 1; i < parts.length; i++) out.push(":seg");
+      break;
+    case "admin": {
+      // /admin/(accounts|credentials|usage). The account id names a household
+      // and the credential id names a device, so both are always redacted.
+      out.push("admin");
+      if (parts[1] === "accounts") {
+        // /admin/accounts, /admin/accounts/:accountId, .../rotate-key
+        out.push("accounts");
+        if (parts[2] !== undefined) out.push(":accountId");
+        if (parts[3] !== undefined) out.push(parts[3] === "rotate-key" ? "rotate-key" : ":seg");
+        for (let i = 4; i < parts.length; i++) out.push(":seg");
+      } else if (parts[1] === "credentials") {
+        // /admin/credentials, /admin/credentials/:credentialId/revoke
+        out.push("credentials");
+        if (parts[2] !== undefined) out.push(":credentialId");
+        if (parts[3] !== undefined) out.push(parts[3] === "revoke" ? "revoke" : ":seg");
+        for (let i = 4; i < parts.length; i++) out.push(":seg");
+      } else if (parts[1] === "usage") {
+        out.push("usage");
+        for (let i = 2; i < parts.length; i++) out.push(":seg");
+      } else {
+        for (let i = 1; i < parts.length; i++) out.push(":seg");
+      }
+      break;
+    }
     default:
       // Unknown route (a 404, a probe): redact every segment so a scanner cannot
       // reflect arbitrary data into the log.
