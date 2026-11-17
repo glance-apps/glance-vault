@@ -261,6 +261,13 @@ stat-ing the blob directory, so a transient orphan left by a crash mid-reclaim
 Shared-mode deployments don't get this endpoint; `du` on the data volume
 serves a single-household instance.
 
+For a readable report, copy `scripts/usage-report.sh` next to your
+`docker-compose.yml` and run it there. It lists each account with its label,
+enrolled devices, when each device last synced, item counts, and storage split
+by app and media. It runs inside the container and reads the admin secret from
+the container's environment, so nothing needs exporting; `--json` prints the
+same data for scripts.
+
 ### Per-account quotas (optional)
 
 All quotas are **unset by default: an unconfigured server enforces nothing and
