@@ -1,0 +1,42 @@
+# Combined GLANCEvault + read-only MCP host example. See README.md next to it.
+#
+#   cp /tmp/gv-example/examples/mcp-vault-host/.env.example .env    (fill the four required values)
+#   docker compose -f examples/mcp-vault-host/docker-compose.yml up --build -d
+#
+# One switch (BIND_ADDR) moves BOTH published ports to another address and the
+# host adds it to the MCP Host allowlist automatically. The container itself
+# always listens on 8080/7893 internally.
+
+services:
+  glancevault-mcp:
+    build:
+      context: .
+      dockerfile: examples/mcp-vault-host/Dockerfile
+    image: glancevault-mcp:local
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${VAULT_PORT:-8080}:8080"
+      - "${BIND_ADDR:-127.0.0.1}:${MCP_PORT:-7893}:7893"
+    environment:
+      TZ: ${TZ:-UTC}
+      BIND_ADDR: ${BIND_ADDR:-127.0.0.1}
+      # --- GLANCEvault server ---
+      GLANCEVAULT_DEVICE_TOKEN: ${GLANCEVAULT_DEVICE_TOKEN:?required}
+      GLANCEVAULT_ALLOWED_ORIGINS: ${GLANCEVAULT_ALLOWED_ORIGINS:-app://dayglance}
+      # --- MCP host (read-only) ---
+      MCP_PASSPHRASE: ${MCP_PASSPHRASE:?required - your dayGLANCE sync passphrase}
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:?required - any long random secret, clients authenticate with it}
+      MCP_ACCOUNT_ID: ${MCP_ACCOUNT_ID:?required - must match the account the devices sync under}
+      MCP_USER_TIMEZONE: ${MCP_USER_TIMEZONE:-UTC}
+      MCP_WEEK_START: ${MCP_WEEK_START:-1}
+      MCP_USER_ID: ${MCP_USER_ID:-}
+      # Only needed behind a reverse-proxy hostname or with BIND_ADDR=0.0.0.0.
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+    volumes:
+      # A named volume keeps ownership sane; if you bind-mount ./data:/data
+      # instead, chown it to uid 1000 first or the server dies at boot.
+      - glancevault-mcp-data:/data
+
+volumes:
+  glancevault-mcp-data:
